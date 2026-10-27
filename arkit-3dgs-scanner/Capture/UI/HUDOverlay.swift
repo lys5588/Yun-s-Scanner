@@ -582,8 +582,8 @@ struct HUDOverlay: View {
                 if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
             }
             .buttonStyle(DSPrimaryButtonStyle(fill: false))
-        case .failed:
-            Button(L10n.text("重新啟動相機")) { controller.prepareCamera() }
+        case _ where controller.canRestartCamera:
+            Button(L10n.text("重新啟動相機")) { controller.restartCamera() }
                 .buttonStyle(DSPrimaryButtonStyle(fill: false))
         case .relocalizing where controller.continueFromLastMap:
             Button(L10n.text("改為全新掃描")) { controller.setContinueFromLastMap(false) }

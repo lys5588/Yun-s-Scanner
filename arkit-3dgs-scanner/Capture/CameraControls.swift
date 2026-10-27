@@ -77,6 +77,16 @@ final class CameraControls: ObservableObject {
         ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
     }
 
+    // Only write while our AR session owns the camera. SwiftUI slider callbacks can
+    // arrive after dismissal; they must not reapply settings after restoration.
+    private var controlledDevice: AVCaptureDevice?
+
+    func beginSession(limitExposure: Bool) {
+        controlledDevice = device
+        restoreAutomaticSettings()
+        if limitExposure { capExposureDuration() }
+    }
+
     // MARK: - 裝置能力（UI 的滑桿範圍要照實際硬體，不能寫死）
 
     var evRange: ClosedRange<Float> {
@@ -110,7 +120,7 @@ final class CameraControls: ObservableObject {
     // MARK: - 套用
 
     private func withDevice(_ body: (AVCaptureDevice) throws -> Void) {
-        guard let d = device else { return }
+        guard let d = controlledDevice else { return }
         do {
             try d.lockForConfiguration()
             defer { d.unlockForConfiguration() }
@@ -195,8 +205,9 @@ final class CameraControls: ObservableObject {
     func capExposureDuration() {
         withDevice { d in
             let lo = CMTimeGetSeconds(d.activeFormat.minExposureDuration)
+            let hi = CMTimeGetSeconds(d.activeFormat.maxExposureDuration)
             d.activeMaxExposureDuration =
-                CMTimeMakeWithSeconds(max(Self.kMaxShutter, lo), preferredTimescale: 1_000_000)
+                CMTimeMakeWithSeconds(min(max(Self.kMaxShutter, lo), hi), preferredTimescale: 1_000_000)
         }
     }
 
@@ -211,8 +222,10 @@ final class CameraControls: ObservableObject {
     /// 但對焦不影響光度、只影響鋭利度，而 3DGS 最怕的就是不鋭利。
     /// 對焦改變帶來的內參呼吸（focus breathing）另有解法：
     /// 每幀內參本來就存在 FrameRecord 裡，COLMAP 匯出改成一張影像一組內參即可完全吸收。
-    func lockForScan() {
-        capExposureDuration()
+    func lockForScan() -> Bool {
+        guard let d = controlledDevice,
+              !d.isAdjustingExposure, !d.isAdjustingWhiteBalance else { return false }
+        var locked = false
         withDevice { d in
             if !isoManual, !shutterManual, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
             if !wbManual, d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
@@ -220,17 +233,28 @@ final class CameraControls: ObservableObject {
             if !focusManual, d.isFocusModeSupported(.continuousAutoFocus) {
                 d.focusMode = .continuousAutoFocus
             }
+            locked = true
         }
+        return locked
     }
 
-    func unlock() {
+    private func restoreAutomaticSettings() {
         withDevice { d in
+            // .invalid removes our override and restores the device's default limit.
+            d.activeMaxExposureDuration = .invalid
+            d.setExposureTargetBias(min(max(0, d.minExposureTargetBias), d.maxExposureTargetBias), completionHandler: nil)
             if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
             if d.isExposureModeSupported(.continuousAutoExposure) { d.exposureMode = .continuousAutoExposure }
             if d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 d.whiteBalanceMode = .continuousAutoWhiteBalance
             }
+            print("[CameraControls] restored auto exposure/focus/WB, default exposure limit, EV=0")
         }
+    }
+
+    func unlock() {
+        restoreAutomaticSettings()
+        controlledDevice = nil
         ev = 0; isoManual = false; shutterManual = false; wbManual = false; focusManual = false
     }
 }

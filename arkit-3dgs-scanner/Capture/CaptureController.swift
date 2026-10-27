@@ -55,8 +55,19 @@ final class CaptureController: NSObject, ObservableObject {
         phase == .idle || phase == .review || phase == .done
     }
     private var authorizationTask: Task<Void, Never>?
+    private var cameraStartupTask: Task<Void, Never>?
+    private var needsCameraSetup = false
+    private var pendingCameraLock = false
+    private var cameraFirstFrameTime: TimeInterval?
+    @Published private(set) var cameraStartupStalled = false
+    var canRestartCamera: Bool {
+        guard phase == .idle else { return false }
+        if case .failed = sessionState { return true }
+        return cameraStartupStalled
+    }
     private var isAttached = false
     private var isInBackground = false
+    private var isCameraSuspended = false
     private var needsSessionResume = false
     private var scanGeneration = UUID()
     /// 即時點雲疊加。**預設顯示** —— RoomPlan 的即時線框已經關掉了，
@@ -161,6 +172,9 @@ final class CaptureController: NSObject, ObservableObject {
     }
     func configureBeta() {
         isBetaCapture = true
+        // Acquisition must adapt to changing illumination. Reconstruction retains
+        // its optional photometric lock, applied only after exposure has settled.
+        lockCameraParams = false
         refineCameraPoses = false
         reconstructSurfaces = false
         reconstructFromImages = false
@@ -324,7 +338,7 @@ final class CaptureController: NSObject, ObservableObject {
                 sessionState = .requestingPermission
                 authorized = await AVCaptureDevice.requestAccess(for: .video)
             }
-            guard !Task.isCancelled, isAttached, !isInBackground else { return }
+            guard !Task.isCancelled, isAttached, !isInBackground, phase == .idle else { return }
             guard authorized else {
                 sessionState = .permissionDenied
                 return
@@ -336,6 +350,7 @@ final class CaptureController: NSObject, ObservableObject {
 
     func sceneActivityChanged(isActive: Bool) {
         isInBackground = !isActive
+        isCameraSuspended = !isActive
         guard isAttached else { return }
         // Permission alerts and other transient inactive states stop rendering before
         // backgrounding. Restore it explicitly when the capture screen becomes active.
@@ -361,6 +376,8 @@ final class CaptureController: NSObject, ObservableObject {
             pausePacing()
             needsSessionResume = true
             sessionState = .interrupted
+            cancelCameraStartupWatchdog()
+            releaseCameraLocks()
             arView?.session.pause()
             monitor.stop()
             UIApplication.shared.isIdleTimerDisabled = false
@@ -378,6 +395,13 @@ final class CaptureController: NSObject, ObservableObject {
 
     /// Invoked on willResignActive, before backgrounding can forbid any new GPU work.
     func prepareForBackgroundTransition() {
+        isCameraSuspended = true
+        if isAttached, phase == .idle || phase == .scanning {
+            releaseCameraLocks()
+            needsCameraSetup = true
+            cameraFirstFrameTime = nil
+            pendingCameraLock = phase == .scanning && lockCameraParams
+        }
         writer?.setSoftwareRendering(true)
         arView?.isPlaying = false
         arView?.rendersContinuously = false
@@ -423,6 +447,9 @@ final class CaptureController: NSObject, ObservableObject {
         poseContinuity.reset()
         sparseTrackingEpoch += 1
         sessionState = .relocalizing
+        releaseCameraLocks()
+        needsCameraSetup = true
+        cameraFirstFrameTime = nil
         arView?.session.run(CaptureSessionConfiguration.make(config: config, useLiDAR: hasLiDAR), options: [])
         monitor.start()
         if phase == .scanning { startPreviewRendering(); startPacing() }
@@ -432,6 +459,7 @@ final class CaptureController: NSObject, ObservableObject {
     }
 
     func teardown() {
+        cancelCameraStartupWatchdog()
         fusionCancel.cancel()
         processingTask?.cancel()
         writer?.setSoftwareRendering(true)
@@ -497,15 +525,41 @@ final class CaptureController: NSObject, ObservableObject {
         sparseTrackingEpoch += 1
         let map = continueFromLastMap ? WorldMapStore.loadLatest() : nil
         sessionState = map == nil ? .initializing : .relocalizing
+        releaseCameraLocks()
+        needsCameraSetup = true
+        cameraFirstFrameTime = nil
         arView?.session.run(CaptureSessionConfiguration.make(config: config, useLiDAR: hasLiDAR, initialWorldMap: map),
                            options: [.resetTracking, .removeExistingAnchors])
         arView?.isPlaying = true
         arView?.rendersContinuously = true
         print("[CaptureSession] started beta=\(isBetaCapture), background=\(isInBackground), playing=\(arView?.isPlaying == true)")
         logVideoFormats()
-        // 曝光上限要在取景階段就設好，AE 才有時間在上限內收斂；
-        // session.run 會重設裝置設定，故必須在 run 之後。
-        cameraControls.capExposureDuration()
+        // Configure on the first delivered frame, once ARKit owns the device.
+        startCameraStartupWatchdog()
+    }
+
+    func restartCamera() {
+        guard isAttached, !isInBackground, phase == .idle, authorizationTask == nil else { return }
+        cancelCameraStartupWatchdog()
+        releaseCameraLocks()
+        arView?.session.pause()
+        prepareCamera()
+    }
+
+    private func startCameraStartupWatchdog() {
+        cancelCameraStartupWatchdog()
+        cameraStartupTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(8)) } catch { return }
+            guard let self, self.isAttached, !self.isInBackground,
+                  self.phase == .idle, !self.trackingReady else { return }
+            self.cameraStartupStalled = true
+        }
+    }
+
+    private func cancelCameraStartupWatchdog() {
+        cameraStartupTask?.cancel()
+        cameraStartupTask = nil
+        if cameraStartupStalled { cameraStartupStalled = false }
     }
 
     // MARK: - 開始 / 停止
@@ -1353,7 +1407,6 @@ final class CaptureController: NSObject, ObservableObject {
         latestTileTransforms = [:]
         visualizer?.reset()
         runSession()          // reset tracking（review/done 期間 session 已暫停）
-        releaseCameraLocks()  // 回到 idle 恢復自動曝光/白平衡，方便取景
         monitor.start()
         phase = .idle
     }
@@ -1764,9 +1817,13 @@ final class CaptureController: NSObject, ObservableObject {
         floorPlan.start(on: session)
     }
 
-    private func applyCameraLocks() { cameraControls.lockForScan() }
+    private func applyCameraLocks() { pendingCameraLock = true }
 
-    private func releaseCameraLocks() { cameraControls.unlock() }
+    private func releaseCameraLocks() {
+        pendingCameraLock = false
+        needsCameraSetup = false
+        cameraControls.unlock()
+    }
 
     nonisolated private static func deviceModel() -> String {
         var sys = utsname()
@@ -1782,8 +1839,18 @@ final class CaptureController: NSObject, ObservableObject {
 extension CaptureController: @preconcurrency ARSessionDelegate {
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard isAttached, !isInBackground, phase == .idle || phase == .scanning else { return }
+        guard isAttached, !isInBackground, !isCameraSuspended, phase == .idle || phase == .scanning else { return }
         if case .failed = sessionState { return }
+        if needsCameraSetup {
+            needsCameraSetup = false
+            cameraFirstFrameTime = frame.timestamp
+            cameraControls.beginSession(limitExposure: !isBetaCapture)
+        }
+        if pendingCameraLock, phase == .scanning, lockCameraParams,
+           let first = cameraFirstFrameTime, frame.timestamp - first >= 1,
+           case .normal = frame.camera.trackingState {
+            if cameraControls.lockForScan() { pendingCameraLock = false }
+        }
         frameCounter += 1
         if frameCounter == 1 { print("[CaptureSession] first frame, tracking=\(frame.camera.trackingState)") }
         if isBetaCapture, frameCounter % 300 == 0 {
@@ -1853,6 +1920,11 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         if sessionState != nextState {
             print("[CaptureSession] tracking=\(frame.camera.trackingState), state=\(nextState)")
             sessionState = nextState
+        }
+        if nextState == .ready {
+            cancelCameraStartupWatchdog()
+        } else if phase == .idle, cameraStartupTask == nil {
+            startCameraStartupWatchdog()
         }
         guard phase == .scanning else { return }
         if captureFirstTimestamp == nil { captureFirstTimestamp = frame.timestamp }
@@ -2049,16 +2121,23 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
+        guard isAttached else { return }
         trackingStability.reset()
         poseContinuity.reset()
         sparseTrackingEpoch += 1
         guard phase == .idle || phase == .scanning else { return }
+        cancelCameraStartupWatchdog()
+        releaseCameraLocks()
         sessionState = .interrupted
     }
 
     func sessionInterruptionEnded(_ session: ARSession) {
         guard isAttached, !isInBackground, phase == .idle || phase == .scanning else { return }
         sessionState = .relocalizing
+        needsCameraSetup = true
+        cameraFirstFrameTime = nil
+        pendingCameraLock = phase == .scanning && lockCameraParams
+        if phase == .idle { startCameraStartupWatchdog() }
         monitor.start()
         shutter.reset()
     }
@@ -2066,11 +2145,17 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
     func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool { true }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
+        guard isAttached else { return }
+        cancelCameraStartupWatchdog()
+        releaseCameraLocks()
         print("[CaptureSession] failed: \(error)")
         sessionState = .failed(error.localizedDescription)
         if phase == .scanning {
             scanNotice = L10n.text("相機追蹤中斷，已停止掃描並保留資料。匯出後請開始新掃描。")
             stopScan()
+        } else if phase == .idle {
+            session.pause()
+            monitor.stop()
         }
     }
 

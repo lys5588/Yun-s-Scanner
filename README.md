@@ -158,6 +158,8 @@ build 7 已原位安装到 iPhone 18 Pro / iOS 27.2，设备查询版本、启�
 
 2026-10-28 视频前台处理修复（build 8）：设备未开放后台 GPU 时，视频位姿估计继续在前台运行，界面改为明确提示保持 App 打开。修复把短暂 `.inactive` 误当作后台而取消处理的问题；只有实际 `.background` 且未获 grant 时才停止，并保留原视频供重试。未增加或绕过后台 GPU 权限。Release 真机、Debug 模拟器构建及 25 项本地化检查通过，build 8 已原位安装。真机中断测试已通过后台停止/原片保留/重试及控制中心短暂失焦不取消的断言，但该整套长测试随后被系统撤销 UI 自动化授权而终止，不能标为完整通过。独立前台全流程重测通过（110.739 秒，含选片和界面等待）：既有 IMG_0568 SDR 视频得到 102 张图像、102 个有效位姿和 489 个点，进入 Beta 预览；矩阵、图像/位姿时间对应及记录的源视频 SHA-256 核对通过。运行日志确认 `gpuSupported=false` 时仍完成计算。源码回归入口 `tools/test_video_foreground_ui.swift` 需加入真机 UI 测试 target，并预先放入注释指定的测试视频；不删除用户场景。证据在 `.build/video-foreground-fix-20261028/`（最终 `DeviceForeground-complete.xcresult` 与 `validation.json`），签名产物在 `.build/iphone-release/20261028-1.0-b8-foreground/`。
 
+2026-10-28 相机生命周期修复（build 9）：相机失焦、后台、退出、失败和重新配置前恢复连续自动曝光/白平衡/对焦，清除曝光时长上限与实际 EV 偏置；关闭相机会话后的控件回调不再写入设备。Beta 默认使用自动曝光/白平衡，不施加重建模式的 1/60 秒曝光上限；重建模式的自动锁定等待首帧后至少 1 秒、正常追踪及曝光/白平衡调节结束。初始化超过 8 秒提供手动重试，禁止在录制过程中重置世界坐标。Release 真机与 Debug 模拟器编译、25 项本地化检查通过，build 9 已原位安装。真机异常恢复 UI 测试通过（53.231 秒）：初始化重试、后台返回、1080p/4K 等宽切换、退出及重新进入。完整录制回归在第一步等待 ARKit 就绪时失败，未进入录制，也未新建或删除场景；设备帧日志持续亮度采样 Y=16、追踪初始化。用户确认测试前系统相机本身仍发灰/黑屏，因此不能宣称拍摄或系统相机异常已解决。源码测试入口 `tools/test_camera_lifecycle_ui.swift` 分开验证正常拍摄和异常恢复；后者通过不能代替前者。证据在 `.build/camera-session-recovery-20261028/`，含 `DeviceLifecycle.xcresult`（失败）、`DeviceRecovery.xcresult`（通过）及 `device-console.log`。 用户随后要求暂停修复并上传当前代码：本提交是未完成实拍验收的工作快照。独立 AVFoundation 对照程序源文件保存在 `tools/camera_isolation_probe.swift`，已编译但尚未运行验收，需单独 App target，不属于扫描 App 的入口。
+
 ## 4. 功能安排与数据约定
 
 ### 4.1 采集与存储

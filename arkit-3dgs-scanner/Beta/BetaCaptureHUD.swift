@@ -63,8 +63,8 @@ struct BetaCaptureHUD: View {
                         Button(L10n.text("開啟相機設定")) {
                             if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                         }
-                    } else if case .failed = controller.sessionState {
-                        Button(L10n.text("重新啟動相機")) { controller.prepareCamera() }
+                    } else if controller.canRestartCamera {
+                        Button(L10n.text("重新啟動相機")) { controller.restartCamera() }
                             .accessibilityIdentifier("betaRestartCamera")
                     }
                 }.padding(12).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 16))
