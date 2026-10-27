@@ -830,6 +830,8 @@
 "视频位姿与点云重建" = "Video camera and point cloud reconstruction";
 
 "后台 GPU 未获准，视频处理已停止。返回前台后可重新开始，原始视频已保留。" = "Background GPU access was not granted, so video processing stopped. Return to the app and start again. The original video is preserved.";
+"正在前台处理，请保持 App 打开，完成后再切换。" = "Processing in the foreground. Keep the app open until processing finishes.";
+"已离开前台，视频处理已停止。请保持 App 打开后重试，原始视频已保留。" = "Video processing stopped when the app entered the background. Try again and keep the app open. The original video is preserved.";
 
 "正在准备处理，请保持前台。" = "Preparing to process. Keep the app open.";
 

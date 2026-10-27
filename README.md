@@ -155,6 +155,9 @@ Beta 验证（2026-10-27）：iPhoneOS / iPhoneSimulator Debug 无签名构建�
 
 build 7 已原位安装到 iPhone 18 Pro / iOS 27.2，设备查询版本、启动和签名校验通过。Device Hub 实测卡片/列表切换、3 个场景全选及批量保存成功；取回 262,211,421 字节 ZIP，验证 3 个场景各有 49/102/102 张图片及相同数量的位姿，中文目录名和 CRC 均通过。未删除或改名手机原有场景；原重建首页仍显示 5 条记录。新增的 49 帧场景来自手机已有数据，本轮未亲自验证其录制过程。GPS 实拍授权/精度/地址、地图底图加载和实时拍摄联动仍待验收；模拟地图坐标不算实测。用户后续澄清系统相机是所有镜头画面发灰模糊，不能用电脑预览的黑色画面替代手机观察，也未确定异常根因。证据位于 `.build/beta-management-20261028/`（`ManagementUI-utf8.xcresult`、`batch-validation.json`、`device-batch-validation.json`）；签名 App 在 `.build/iphone-release/20261028-1.0-b7-management/`。
 
+
+2026-10-28 视频前台处理修复（build 8）：设备未开放后台 GPU 时，视频位姿估计继续在前台运行，界面改为明确提示保持 App 打开。修复把短暂 `.inactive` 误当作后台而取消处理的问题；只有实际 `.background` 且未获 grant 时才停止，并保留原视频供重试。未增加或绕过后台 GPU 权限。Release 真机、Debug 模拟器构建及 25 项本地化检查通过，build 8 已原位安装。真机中断测试已通过后台停止/原片保留/重试及控制中心短暂失焦不取消的断言，但该整套长测试随后被系统撤销 UI 自动化授权而终止，不能标为完整通过。独立前台全流程重测通过（110.739 秒，含选片和界面等待）：既有 IMG_0568 SDR 视频得到 102 张图像、102 个有效位姿和 489 个点，进入 Beta 预览；矩阵、图像/位姿时间对应及记录的源视频 SHA-256 核对通过。运行日志确认 `gpuSupported=false` 时仍完成计算。源码回归入口 `tools/test_video_foreground_ui.swift` 需加入真机 UI 测试 target，并预先放入注释指定的测试视频；不删除用户场景。证据在 `.build/video-foreground-fix-20261028/`（最终 `DeviceForeground-complete.xcresult` 与 `validation.json`），签名产物在 `.build/iphone-release/20261028-1.0-b8-foreground/`。
+
 ## 4. 功能安排与数据约定
 
 ### 4.1 采集与存储

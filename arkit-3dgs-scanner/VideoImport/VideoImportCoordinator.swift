@@ -52,8 +52,11 @@ final class VideoImportCoordinator: ObservableObject {
     private var cleanupTime: UIBackgroundTaskIdentifier = .invalid
     @Published private(set) var backgroundStatus = ""
 
-    func sceneActivityChanged(isActive: Bool) {
-        guard !isActive, isBusy, processingLease?.isGranted != true else { return }
+    func sceneDidEnterBackground() {
+        // Inactive scenes are still foreground (system overlays, interruptions).
+        // Only an actual background transition needs a continued-processing grant.
+        guard isBusy, processingLease?.isGranted != true else { return }
+        BackgroundProcessingDiagnostics.record("videoStoppedOnBackground", title: stageTitle)
         beginCleanupTime()
         cancel(forBackground: true)
     }
@@ -98,6 +101,7 @@ final class VideoImportCoordinator: ObservableObject {
         cleanupDraft()
         abandoned = false
         message = nil
+        backgroundStatus = ""
         phase = .copying
         let id = UUID(); generation = id
         let worker = Task.detached(priority: .userInitiated) {
@@ -151,7 +155,12 @@ final class VideoImportCoordinator: ObservableObject {
                 self?.beginCleanupTime()
                 self?.cancel()
             }, onChange: { [weak self] in
-                self?.backgroundStatus = self?.processingLease?.status ?? ""
+                guard let self else { return }
+                // Background scheduling is optional. Its failure must not look like
+                // a failure of the foreground photogrammetry operation.
+                self.backgroundStatus = self.processingLease?.isGranted == true
+                    ? self.processingLease?.status ?? ""
+                    : L10n.text("正在前台处理，请保持 App 打开，完成后再切换。")
             })
         processingLease = lease
         lease.begin()
@@ -235,7 +244,7 @@ final class VideoImportCoordinator: ObservableObject {
         task?.cancel()
         releaseIdleTimer()
         message = forBackground
-            ? L10n.text("后台 GPU 未获准，视频处理已停止。返回前台后可重新开始，原始视频已保留。")
+            ? L10n.text("已离开前台，视频处理已停止。请保持 App 打开后重试，原始视频已保留。")
             : L10n.text("已取消處理，原始影片未變更。")
     }
 

@@ -132,6 +132,7 @@ struct VideoImportView: View {
                         }
                         Text(model.backgroundStatus.isEmpty ? L10n.text("正在准备处理，请保持前台。") : model.backgroundStatus)
                             .font(.caption).foregroundStyle(DS.Palette.textSecondary)
+                            .accessibilityIdentifier("videoProcessingMode")
                         Button(L10n.text("取消處理")) { model.cancel() }
                             .accessibilityIdentifier("cancelVideoPreparation")
                     }
@@ -236,8 +237,11 @@ struct VideoImportView: View {
             if phase != .active {
                 player?.pause()
                 photoTask?.cancel()
-                model.sceneActivityChanged(isActive: false)
             }
+            if phase == .inactive, model.isBusy {
+                BackgroundProcessingDiagnostics.record("videoForegroundInactive", title: model.stageTitle)
+            }
+            if phase == .background { model.sceneDidEnterBackground() }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             model.cancel()
