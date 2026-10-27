@@ -1,0 +1,3 @@
+"NSCameraUsageDescription" = "需要使用相机采集 3DGS 训练所需的图像与相机姿态。";
+
+"NSLocationWhenInUseUsageDescription" = "拍摄时记录场景位置，用于地图查看并随场景数据导出；不允许定位也可继续拍摄。";

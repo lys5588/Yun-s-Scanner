@@ -1,0 +1,1570 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// Copyright 2026 Kuo Feng-Yuan (KuoFengYuan). On-device 3DGS training; see LICENSE and NOTICE.
+// End-to-end tests of on-device 3DGS training on synthetic scans (Mac GPU, same Metal kernels):
+// convergence, PPISP exposure recovery, pose refinement, the Gaussian cap under a small memory
+// budget, checkpoint round trip / corruption / atomicity, PLY export frame math, the session
+// state machine (pause, stop with checkpoint, resume, finish), the saved-model viewer, and a
+// large-scan stress run with bounded memory.
+//
+// bash tools/test_gaussian_training.sh
+import Foundation
+import Metal
+import ImageIO
+import UniformTypeIdentifiers
+import simd
+
+@main struct GaussianTrainingTests {
+    static var checks = 0
+    static func check(_ ok: Bool, _ message: String) {
+        if !ok { print("FAIL: \(message)"); exit(1) }
+        checks += 1; print("PASS: \(message)")
+    }
+
+    static var library: URL!
+    static var metal: GaussianMetal!
+    static let temp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("gs-training-tests-\(getpid())")
+
+    // MARK: Synthetic scans
+
+    struct Scene {
+        var positions: [SIMD3<Float>] = [], colors: [SIMD3<Float>] = [], scales: [Float] = []
+    }
+
+    /// A textured corner: floor and two walls of small coloured splats, plus a box.
+    static func scene(seed: UInt64) -> Scene {
+        var r = SplitMix64(seed: seed)
+        var s = Scene()
+        func add(_ p: SIMD3<Float>, _ c: SIMD3<Float>) { s.positions.append(p); s.colors.append(c); s.scales.append(0.035) }
+        for i in 0..<34 { for j in 0..<34 {
+            let u = Float(i) / 33 * 2 - 1, v = Float(j) / 33 * 2 - 1
+            let check: Float = ((i / 4 + j / 4) % 2 == 0) ? 0.85 : 0.25
+            add(SIMD3(u * 1.2, -0.6, v * 1.2 - 2.4), SIMD3(check, 0.5 + 0.3 * r.nextFloat(), 0.3))
+            add(SIMD3(u * 1.2, v * 0.6, -3.6), SIMD3(0.3 + 0.5 * r.nextFloat(), check * 0.8, 0.6))
+            add(SIMD3(-1.2, v * 0.6, u * 1.2 - 2.4), SIMD3(0.7, 0.35, check))
+        } }
+        for i in 0..<14 { for j in 0..<14 {
+            let u = Float(i) / 13 - 0.5, v = Float(j) / 13 - 0.5
+            add(SIMD3(u * 0.5 + 0.2, v * 0.5 - 0.35, -2.2), SIMD3(0.9, 0.9 * r.nextFloat(), 0.1))
+        } }
+        return s
+    }
+
+    /// Camera-to-world (ARKit convention, row-major) looking at `target` from `eye`.
+    static func arkitPose(eye: SIMD3<Double>, target: SIMD3<Double>) -> [Double] {
+        let back = simd_normalize(eye - target)                       // +Z (camera looks down -Z)
+        let right = simd_normalize(simd_cross(SIMD3(0, 1, 0), back))
+        let up = simd_cross(back, right)
+        return [right.x, up.x, back.x, eye.x, right.y, up.y, back.y, eye.y, right.z, up.z, back.z, eye.z, 0, 0, 0, 1]
+    }
+
+    struct SyntheticScan {
+        var directory: URL
+        var truePoses: [[Double]]
+        var trueExposure: [Double]
+        /// Ground-truth model and renderer (sharp reference views).
+        var model: GaussianModel
+        var renderer: GaussianRenderer
+        var background = SIMD3<Float>(0.05, 0.05, 0.08)
+    }
+
+    /// Writes a scan directory (images/, poses.jsonl, review.ply) rendered from a ground-truth model.
+    /// `motion` integrates each photo over its exposure along the camera path and reads rows at
+    /// their rolling-shutter times (physically, from many sub-frame renders), like a handheld
+    /// capture; poses are recorded at the frame times.
+    static func writeScan(name: String, frames: Int, width: Int = 160, height: Int = 120, exposureSpread: Double = 0,
+                          poseNoise: (translation: Double, degrees: Double) = (0, 0), seed: UInt64 = 1,
+                          grid: Bool = false, motion: (exposure: Double, readout: Double)? = nil) throws -> SyntheticScan {
+        let dir = temp.appendingPathComponent("scan_" + name)
+        try? FileManager.default.removeItem(at: dir)
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("images"), withIntermediateDirectories: true)
+        let gt = scene(seed: seed)
+        let capacity = (gt.positions.count + 1023) / 1024 * 1024
+        let model = try GaussianModel(metal: metal, capacity: capacity, shDegree: 1, trainable: false)
+        model.initialize(positions: gt.positions, colors: gt.colors)
+        let p = model.floats(model.params)
+        for i in 0..<gt.positions.count {
+            for k in 0..<3 { p[Int(model.layout.scales) + 3 * i + k] = log(gt.scales[i]) }
+            p[Int(model.layout.opacities) + i] = 3
+        }
+        let raster = try GaussianRasterizer(metal: metal, capacity: capacity, intersectionCapacity: capacity * 40, maxTiles: 65_536)
+        let renderer = try GaussianRenderer(metal: metal, raster: raster, maxPixels: width * height)
+        var rng = SplitMix64(seed: seed &+ 99)
+        var records = Data(), truePoses: [[Double]] = [], exposures: [Double] = []
+        let fx = Double(width) * 0.9
+        let background = SIMD3<Float>(0.05, 0.05, 0.08)
+        /// Pose at continuous frame time `f` (frames are 0.1 s apart).
+        func path(at f: Double) -> [Double] {
+            let a = -0.9 + 1.5 * f / Double(max(1, frames - 1))
+            var eye = SIMD3(1.6 * sin(a), 0.15 + 0.2 * sin(f * 0.7), -2.4 + 1.6 * cos(a))
+            if grid {
+                // 5 cm apart: no view is a near-duplicate that frame selection would replace.
+                let columns = 40, i = Int(f)
+                eye = SIMD3(-1.0 + 0.05 * Double(i % columns), -0.3 + 0.05 * Double(i / columns), -0.3)
+            }
+            return arkitPose(eye: eye, target: SIMD3(0, -0.2, -2.6))
+        }
+        let intr = CameraIntrinsics(fx: fx, fy: fx, cx: Double(width) / 2, cy: Double(height) / 2, width: width, height: height)
+        func still(_ pose: [Double]) throws -> [UInt8] {
+            var camera = GaussianCamera(worldToCamera: GaussianCamera.worldToCamera(arkitRowMajorC2W: pose), fx: fx, fy: fx,
+                                        cx: intr.cx, cy: intr.cy, width: width, height: height, mipFilter: true)
+            camera.sh = .zero
+            guard let frame = try renderer.render(model: model, camera: camera, shDegree: 0, isp: nil, background: background) else {
+                throw GaussianExport.ExportError.damaged
+            }
+            return [UInt8](frame.pixels)
+        }
+        for f in 0..<frames {
+            let pose = path(at: Double(f))
+            truePoses.append(pose)
+            let ev = exposureSpread > 0 ? (Double(rng.nextFloat()) * 2 - 1) * exposureSpread : 0
+            exposures.append(ev)
+            var pixels = try still(pose)
+            if let motion {
+                // Sub-frame renders across readout + exposure; each row averages the renders
+                // exposed while it was read (row time (y / H - 0.5) * readout).
+                let span: Double = motion.readout + motion.exposure
+                let slices = 41
+                var times: [Double] = []
+                for k in 0..<slices { times.append(-span / 2 + span * Double(k) / Double(slices - 1)) }
+                var renders: [[UInt8]] = []
+                for t in times { renders.append(try still(path(at: Double(f) + t * 10))) }
+                var out = [Double](repeating: 0, count: pixels.count), weight = [Double](repeating: 0, count: height)
+                for y in 0..<height {
+                    let tau = ((Double(y) + 0.5) / Double(height) - 0.5) * motion.readout
+                    for (k, t) in times.enumerated() where abs(t - tau) <= motion.exposure / 2 {
+                        weight[y] += 1
+                        for i in (y * width * 4)..<((y + 1) * width * 4) { out[i] += Double(renders[k][i]) }
+                    }
+                }
+                for y in 0..<height where weight[y] > 0 {
+                    for i in (y * width * 4)..<((y + 1) * width * 4) { pixels[i] = UInt8((out[i] / weight[y]).rounded()) }
+                }
+            }
+            if ev != 0 {
+                let gain = pow(2, ev)
+                for i in 0..<pixels.count where i % 4 != 3 { pixels[i] = UInt8(min(255, (Double(pixels[i]) * gain).rounded())) }
+            }
+            let name = String(format: "frame_%05d.jpg", f + 1)
+            try writeJPEG(pixels, width: width, height: height, to: dir.appendingPathComponent("images").appendingPathComponent(name))
+            // Recorded pose, optionally perturbed (what ARKit would have reported).
+            var saved = pose
+            if poseNoise.translation > 0 || poseNoise.degrees > 0 {
+                let axis = simd_normalize(SIMD3(Double(rng.nextFloat()) - 0.5, Double(rng.nextFloat()) - 0.5, Double(rng.nextFloat()) - 0.5))
+                let q = simd_quatd(angle: poseNoise.degrees * .pi / 180, axis: axis)
+                let R = simd_double3x3(rows: [SIMD3(pose[0], pose[1], pose[2]), SIMD3(pose[4], pose[5], pose[6]), SIMD3(pose[8], pose[9], pose[10])])
+                let R2 = simd_double3x3(q) * R
+                let dt = simd_normalize(SIMD3(Double(rng.nextFloat()) - 0.5, Double(rng.nextFloat()) - 0.5, Double(rng.nextFloat()) - 0.5)) * poseNoise.translation
+                saved = [R2[0][0], R2[1][0], R2[2][0], pose[3] + dt.x, R2[0][1], R2[1][1], R2[2][1], pose[7] + dt.y,
+                         R2[0][2], R2[1][2], R2[2][2], pose[11] + dt.z, 0, 0, 0, 1]
+            }
+            let record = FrameRecord(id: f + 1, timestamp: Double(f) / 10, transform: saved, intrinsics: intr,
+                                     exposureDuration: motion?.exposure ?? 0.01, exposureOffsetEV: 0, iso: 0, estimatedBlurPx: 0,
+                                     imageFile: name)
+            records.append(try JSONEncoder().encode(record)); records.append(0x0A)
+        }
+        try records.write(to: dir.appendingPathComponent("poses.jsonl"))
+        // Seed cloud: every second ground-truth centre with 1 cm noise.
+        var points: [CloudPoint] = []
+        for i in stride(from: 0, to: gt.positions.count, by: 2) {
+            let n = SIMD3(rng.nextFloat() - 0.5, rng.nextFloat() - 0.5, rng.nextFloat() - 0.5) * 0.02
+            let c = simd_clamp(gt.colors[i], .zero, SIMD3(repeating: 1)) * 255
+            points.append(CloudPoint(x: gt.positions[i].x + n.x, y: gt.positions[i].y + n.y, z: gt.positions[i].z + n.z,
+                                     r: UInt8(c.x), g: UInt8(c.y), b: UInt8(c.z)))
+        }
+        try ExportManager.writePLY(points, to: dir.appendingPathComponent("review.ply"))
+        return SyntheticScan(directory: dir, truePoses: truePoses, trueExposure: exposures, model: model, renderer: renderer,
+                             background: background)
+    }
+
+    static func writeJPEG(_ rgba: [UInt8], width: Int, height: Int, to url: URL) throws {
+        let data = Data(rgba)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue), provider: provider,
+                                  decode: nil, shouldInterpolate: false, intent: .defaultIntent),
+              let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+            throw GaussianExport.ExportError.damaged
+        }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw GaussianExport.ExportError.damaged }
+    }
+
+    // MARK: Helpers
+
+    /// Deterministic Gaussian noise for synthetic photos.
+    struct LCGNoise {
+        var state: UInt64
+        mutating func uniform() -> Double {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return max(1e-12, Double(state >> 11) / Double(1 << 53))
+        }
+        mutating func gaussian() -> Double { (-2 * log(uniform())).squareRoot() * cos(2 * .pi * uniform()) }
+    }
+
+    static func config(iterations: Int, ppisp: Bool = false, pose: Bool = false, maxGaussians: Int = 40_000,
+                       holdOut: Int = 0, sh: Int = 1) -> GaussianTrainingConfiguration {
+        var c = GaussianTrainingConfiguration.preset(.quick)
+        c.iterations = iterations
+        c.longEdge = 160
+        c.maxGaussians = maxGaussians
+        c.shDegree = sh
+        c.ppisp = ppisp
+        c.poseOptimization = pose
+        c.holdOutEvery = holdOut
+        return c
+    }
+
+    static func trainer(_ scan: URL, _ c: GaussianTrainingConfiguration, budgetMB: Int = 512, initialize: Bool = true) throws -> GaussianTrainer {
+        let dataset = try TrainingDataset.prepare(scan: scan, longEdge: c.longEdge, holdOutEvery: c.holdOutEvery, maxPoints: 250_000)
+        let plan = try TrainingMemoryPlan.fit(width: dataset.width, height: dataset.height, shDegree: c.shDegree,
+                                              requestedGaussians: c.maxGaussians, budgetBytes: budgetMB << 20,
+                                              imageSlots: 3, previewPixels: 320 * 240)
+        let t = try GaussianTrainer(configuration: c, dataset: dataset, plan: plan, metal: metal)
+        if initialize { try t.initializeModel() }
+        return t
+    }
+
+    static func train(_ t: GaussianTrainer, until iteration: Int, onStep: (TrainingStepReport) -> Void = { _ in }) throws -> [TrainingStepReport] {
+        var reports: [TrainingStepReport] = []
+        while t.iteration < iteration { let r = try t.step(); reports.append(r); onStep(r) }
+        return reports
+    }
+
+    static func meanPSNR(_ t: GaussianTrainer, frames: [Int]) throws -> Double { try t.evaluate(frames: frames).psnr }
+
+    static func correlation(_ a: [Double], _ b: [Double]) -> Double {
+        let ma = a.reduce(0, +) / Double(a.count), mb = b.reduce(0, +) / Double(b.count)
+        var sab = 0.0, saa = 0.0, sbb = 0.0
+        for (x, y) in zip(a, b) { sab += (x - ma) * (y - mb); saa += (x - ma) * (x - ma); sbb += (y - mb) * (y - mb) }
+        return sab / max(1e-12, (saa * sbb).squareRoot())
+    }
+
+    // MARK: Tests
+
+    static func main() throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        library = URL(fileURLWithPath: CommandLine.arguments[1])
+        metal = try GaussianMetal(libraryURL: library)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        // GS_ONLY=session,enhancement runs a subset while iterating.
+        let only = ProcessInfo.processInfo.environment["GS_ONLY"].map { Set($0.split(separator: ",").map(String.init)) }
+        let tests: [(String, () throws -> Void)] = [
+            ("memoryPlan", memoryPlan),
+            ("resolutionAndHoldOut", resolutionAndHoldOut),
+            ("strategyUnits", strategyUnits),
+            ("optimizerKernels", optimizerKernels),
+            ("regionQuotas", regionQuotas),
+            ("exportFrame", exportFrame),
+            ("sogFormat", sogFormat),
+            ("depthSeeding", depthSeeding),
+            ("covisibleSharpness", covisibleSharpness),
+            ("holeFilling", holeFilling),
+            ("convergence", convergence),
+            ("enhancement", enhancement),
+            ("ppispRecovery", ppispRecovery),
+            ("poseRefinement", poseRefinement),
+            ("captureMotion", captureMotion),
+            ("capUnderSmallBudget", capUnderSmallBudget),
+            ("checkpoints", checkpoints),
+            ("session", session),
+            ("sessionBackgroundControls", sessionBackgroundControls),
+            ("largeScanStress", largeScanStress),
+        ]
+        for (name, test) in tests where only?.contains(name) ?? true { try test() }
+        print("\(checks) training checks passed")
+    }
+
+    static func resolutionAndHoldOut() throws {
+        typealias Resolution = GaussianTrainingConfiguration.Resolution
+        let edges = Resolution.allCases.map(\.longEdge)
+        check(edges == [960, 1_440, 1_920] && Resolution.allCases.allSatisfy { Resolution(longEdge: $0.longEdge) == $0 }
+              && GaussianTrainingConfiguration.Preset.allCases.allSatisfy { GaussianTrainingConfiguration.preset($0).resolution == .low },
+              "resolution tiers map to 960 / 1440 / 1920 px, and every preset starts at low")
+        let full = try TrainingMemoryPlan.fit(width: 1_920, height: 1_440, shDegree: 3, requestedGaussians: 600_000,
+                                              budgetBytes: 2_600 << 20, imageSlots: 3, previewPixels: 320 * 240)
+        let low = try TrainingMemoryPlan.fit(width: 960, height: 720, shDegree: 3, requestedGaussians: 600_000,
+                                             budgetBytes: 2_600 << 20, imageSlots: 3, previewPixels: 320 * 240)
+        check(full.gaussianCapacity == low.gaussianCapacity && full.totalBytes > low.totalBytes + (200 << 20),
+              "full resolution keeps the Gaussian cap in a large budget and plans the larger image buffers (\(full.totalBytes >> 20) vs \(low.totalBytes >> 20) MB)")
+        let bands = GaussianRasterizer.backwardBands(tilesX: 120, tilesY: 90)
+        check(bands.first?.lowerBound == 0 && bands.last?.upperBound == 90 && zip(bands, bands.dropFirst()).allSatisfy { $0.upperBound == $1.lowerBound }
+              && bands.allSatisfy { $0.count * 120 <= 2_048 } && GaussianRasterizer.backwardBands(tilesX: 60, tilesY: 45).count == 2,
+              "the backward pass covers every tile row in bands of at most 2,048 tiles (\(bands.count) at 1920 x 1440)")
+        let scan = try writeScan(name: "segment", frames: 40)
+        let segment = try TrainingDataset.prepare(scan: scan.directory, longEdge: 1_920, holdOutEvery: 8, maxPoints: 250_000, holdOutSegment: 0.1)
+        let held = segment.validationFrames
+        check(segment.width == 160 && held == Array(18..<22),
+              "a held-out segment is one contiguous middle stretch (frames \(held)) and photos are never upscaled")
+    }
+
+    static func memoryPlan() throws {
+        let plan = try TrainingMemoryPlan.fit(width: 960, height: 720, shDegree: 3, requestedGaussians: 600_000, budgetBytes: 900 << 20)
+        check(plan.totalBytes <= 900 << 20 && plan.gaussianCapacity < 600_000 && plan.gaussianCapacity % 1024 == 0,
+              "memory plan fits the budget by lowering the Gaussian cap (\(plan.gaussianCapacity) in \(plan.totalBytes >> 20) MB)")
+        let roomy = try TrainingMemoryPlan.fit(width: 960, height: 720, shDegree: 3, requestedGaussians: 100_000, budgetBytes: 4 << 30)
+        check(roomy.gaussianCapacity == 100_352, "memory plan keeps the requested cap when memory allows")
+        var threwOverflow = false
+        do { _ = try TrainingMemoryPlan.fit(width: Int.max / 2, height: 4, shDegree: 3, requestedGaussians: 10, budgetBytes: Int.max) }
+        catch TrainingMemoryPlan.PlanError.overflow { threwOverflow = true }
+        check(threwOverflow, "allocation sizes are overflow-checked")
+        var threwInsufficient = false
+        do { _ = try TrainingMemoryPlan.fit(width: 960, height: 720, shDegree: 3, requestedGaussians: 10_000, budgetBytes: 64 << 20) }
+        catch TrainingMemoryPlan.PlanError.insufficientMemory { threwInsufficient = true }
+        check(threwInsufficient, "an impossible budget is refused before allocating")
+        let small = TrainingMemoryPlan.automaticBudget(available: 1_500 << 20, physical: 4 << 30)
+        let large = TrainingMemoryPlan.automaticBudget(available: 6_000 << 20, physical: 8 << 30)
+        check(small <= 900 << 20 && small < Int(Double(1_500 << 20) * 0.55) && large == 2_600 << 20,
+              "automatic budget keeps headroom and a device-tier ceiling")
+    }
+
+    /// The single-dispatch Adam against a CPU reference, and the parallel Gumbel keys against a
+    /// sequential pass.
+    static func optimizerKernels() throws {
+        // Gumbel keys: chunks keyed in parallel give the sequential pass's keys and generator state.
+        var weightRNG = SplitMix64(seed: 21)
+        let weights: [Float] = (0..<100_003).map { i in
+            let u = weightRNG.nextFloat()
+            return i % 97 == 0 ? .nan : i % 89 == 0 ? .infinity : u < 0.2 ? 0 : u
+        }
+        let excluded = (0..<weights.count).map { $0 % 13 == 0 }
+        var parallel = SplitMix64(seed: 5), sequential = SplitMix64(seed: 5)
+        let keys = MRNFStrategy.gumbelKeys(weights, rng: &parallel, excluding: excluded)
+        var reference: [(Float, Int)] = []
+        for (i, w) in weights.enumerated() {
+            let u = min(max(sequential.nextFloat(), 1e-10), 1 - 1e-7)
+            guard w > 0, w.isFinite, !excluded[i] else { continue }
+            reference.append((log(w) - log(-log(u)), i))
+        }
+        check(keys.count == reference.count && zip(keys, reference).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+              && parallel.state == sequential.state,
+              "parallel Gumbel keys equal a sequential pass, in row order and with the same generator state")
+
+        // Adam: random parameters, moments, gradients and statistics; rows the view did not reach
+        // hold garbage gradients, which must count as zero.
+        let scan = try writeScan(name: "adam", frames: 4)
+        let t = try trainer(scan.directory, config(iterations: 1_000, sh: 2))
+        let model = t.model, n = model.count, layout = model.layout
+        var rng = SplitMix64(seed: 77)
+        func random(_ a: Float, _ b: Float) -> Float { a + (b - a) * rng.nextFloat() }
+        let p = model.floats(model.params), g = model.floats(model.grads), m = model.floats(model.adamM), v = model.floats(model.adamV)
+        let tiles = t.raster.tiles.contents().bindMemory(to: UInt32.self, capacity: model.capacity)
+        let active = model.stat(GaussianStats.active), share = model.stat(GaussianStats.shareNow)
+        for row in 0..<n {
+            tiles[row] = row % 3 == 0 ? 0 : UInt32(1 + row % 5)
+            active[row] = row % 17 == 0 ? 0 : 1
+            share[row] = row % 4 == 0 ? random(0.2, 0.9) : random(0, 0.05)
+        }
+        for (offset, width) in layout.groups {
+            for row in 0..<n {
+                for k in 0..<width {
+                    let i = offset + row * width + k
+                    p[i] = random(-2, 2); m[i] = random(-0.1, 0.1); v[i] = random(0, 0.01)
+                    g[i] = tiles[row] == 0 ? 1_000 : random(-0.5, 0.5)
+                }
+            }
+        }
+        func runAdam(iteration: Int, sparse: Bool) throws -> (before: [Float], after: [Float], m: [Float], v: [Float]) {
+            let before = Array(UnsafeBufferPointer<Float>(start: p, count: layout.totalFloats))
+            t.sparseAdam = sparse
+            model.adamStep = 7
+            let buffer = metal.queue.makeCommandBuffer()!, e = buffer.makeComputeCommandEncoder()!
+            t.encodeAdam(e, iteration: iteration, count: n)
+            e.endEncoding(); buffer.commit(); buffer.waitUntilCompleted()
+            return (before, Array(UnsafeBufferPointer<Float>(start: p, count: layout.totalFloats)),
+                    Array(UnsafeBufferPointer<Float>(start: m, count: layout.totalFloats)), Array(UnsafeBufferPointer<Float>(start: v, count: layout.totalFloats)))
+        }
+        for (iteration, sparse) in [(t.strategy.schedule.shWarmup + 10, false), (1, false), (t.strategy.schedule.shWarmup + 10, true)] {
+            let mBefore = Array(UnsafeBufferPointer<Float>(start: m, count: layout.totalFloats))
+            let vBefore = Array(UnsafeBufferPointer<Float>(start: v, count: layout.totalFloats))
+            let gpu = try runAdam(iteration: iteration, sparse: sparse)
+            let refining = iteration < t.strategy.schedule.stopRefine
+            let lrs: [Float] = [t.strategy.meansLR(at: iteration), t.strategy.scalesLR(at: iteration), Float(MRNFConstants.rotationLR),
+                                Float(MRNFConstants.opacityLR), Float(MRNFConstants.sh0LR), Float(MRNFConstants.shNLR)]
+            let bc1 = Float(1 - pow(0.9, 7.0)), bc2 = Float(1 - pow(0.999, 7.0))
+            let reg = MRNFConstants.opacityRegularizer / Float(max(1, model.activeCount))
+            var worst: Float = 0, untouchedOK = true
+            for (group, (offset, width)) in layout.groups.enumerated() {
+                let skipped = group == 5 && iteration <= t.strategy.schedule.shWarmup
+                for row in 0..<n {
+                    for k in 0..<width {
+                        let i = offset + row * width + k
+                        let unchanged = skipped || active[row] < 0.5 || (sparse && tiles[row] == 0)
+                        if unchanged {
+                            untouchedOK = untouchedOK && gpu.after[i] == gpu.before[i] && gpu.m[i] == mBefore[i] && gpu.v[i] == vBefore[i]
+                            continue
+                        }
+                        var grad: Float = tiles[row] == 0 ? 0 : g[i]
+                        if group == 3 { let s = 1 / (1 + exp(-gpu.before[i])); grad += reg * s * (1 - s) }
+                        if group == 1 && refining && share[row] > MRNFConstants.maxScreenShare {
+                            grad += MRNFConstants.screenSharePenalty * log2(share[row] / MRNFConstants.maxScreenShare)
+                                * (vBefore[i].squareRoot() / bc2.squareRoot() + 1e-15)
+                        }
+                        let beta1: Float = 0.9, beta2: Float = 0.999
+                        let mi = beta1 * mBefore[i] + (1 - beta1) * grad, vi = beta2 * vBefore[i] + (1 - beta2) * grad * grad
+                        let step = lrs[group] * (mi / bc1) / ((vi / bc2).squareRoot() + 1e-15)
+                        // Within 0.5% of the step (the moments' rounding), or a few ulps of the parameter.
+                        let allowed = 5e-3 * abs(step) + 4 * gpu.before[i].ulp
+                        // Moments within 1e-5 of their terms, or a few ulps of the gradient term: with
+                        // fast math the kernel may evaluate (1 - beta) x as x - beta x, as it always has.
+                        let e = max(abs(gpu.after[i] - (gpu.before[i] - step)) / allowed,
+                                    abs(gpu.m[i] - mi) / (1e-5 * (abs(beta1 * mBefore[i]) + abs((1 - beta1) * grad)) + 4 * grad.ulp),
+                                    abs(gpu.v[i] - vi) / (1e-5 * (beta2 * vBefore[i] + (1 - beta2) * grad * grad) + 4 * (grad * grad).ulp))
+                        worst = max(worst, e)
+                    }
+                }
+            }
+            check(worst <= 1 && untouchedOK,
+                  "one-dispatch Adam matches the CPU reference (iteration \(iteration)\(sparse ? ", visible rows only" : ""), worst error \(worst) of the tolerance)")
+        }
+    }
+
+    static func strategyUnits() throws {
+        // Gumbel top-k: k distinct rows with positive weight, never excluded ones.
+        var rng = SplitMix64(seed: 3)
+        var weights = [Float]()
+        weights.reserveCapacity(1_000)
+        for index in 0..<1_000 {
+            weights.append(index % 3 == 0 ? 0 : Float(index % 7 + 1))
+        }
+        var excluded = [Bool](repeating: false, count: 1000)
+        for i in 0..<100 { excluded[i] = true }
+        let picked = MRNFStrategy.gumbelTopK(weights, k: 200, rng: &rng, excluding: excluded)
+        check(picked.count == 200 && Set(picked).count == 200 && picked.allSatisfy { weights[$0] > 0 && !excluded[$0] },
+              "Gumbel top-k draws distinct, positive-weight, non-excluded parents")
+        // Heavier weights are drawn more often.
+        var heavy = 0, light = 0
+        for s in 0..<200 {
+            var g = SplitMix64(seed: UInt64(s))
+            let one = MRNFStrategy.gumbelTopK([1, 9], k: 1, rng: &g, excluding: [false, false])
+            if one == [1] { heavy += 1 } else { light += 1 }
+        }
+        check(heavy > light * 4, "sampling probability follows the weights (\(heavy) vs \(light))")
+        // Split rule on one Gaussian.
+        let model = try GaussianModel(metal: metal, capacity: 1024, shDegree: 0)
+        model.initialize(positions: [SIMD3(0, 0, 0)], colors: [SIMD3(0.5, 0.5, 0.5)])
+        let p = model.floats(model.params)
+        p[Int(model.layout.scales)] = log(0.2); p[Int(model.layout.scales) + 1] = log(0.05); p[Int(model.layout.scales) + 2] = log(0.05)
+        p[Int(model.layout.opacities)] = 2
+        let e = model.stat(GaussianStats.errorMax), v = model.stat(GaussianStats.visibility)
+        e[0] = 1; v[0] = 1
+        var strategy = MRNFStrategy(schedule: MRNFSchedule(iterations: 1000), maxGaussians: 10)
+        strategy.bounds = MRNFBounds(center: .zero, maxExtent: 1, medianSize: 1, valid: true)
+        // A single candidate: 7% of 1 rounds to 0, so force growth with more candidates below.
+        _ = strategy.refine(model, iteration: 25)
+        check(model.activeCount == 1, "no split when 7% of the candidates rounds to zero")
+        let many = try GaussianModel(metal: metal, capacity: 1024, shDegree: 0)
+        many.initialize(positions: (0..<100).map { SIMD3(Float($0) * 0.1, 0, 0) }, colors: Array(repeating: SIMD3(0.5, 0.5, 0.5), count: 100))
+        let q = many.floats(many.params)
+        for i in 0..<100 {
+            q[Int(many.layout.scales) + 3 * i] = log(0.2); q[Int(many.layout.scales) + 3 * i + 1] = log(0.05); q[Int(many.layout.scales) + 3 * i + 2] = log(0.05)
+            q[Int(many.layout.opacities) + i] = 2
+            many.stat(GaussianStats.errorMax)[i] = 1; many.stat(GaussianStats.visibility)[i] = 1
+        }
+        let before = (0..<100).map { many.mean($0) }
+        var s2 = MRNFStrategy(schedule: MRNFSchedule(iterations: 1000), maxGaussians: 1000)
+        s2.bounds = MRNFBounds(center: .zero, maxExtent: 5, medianSize: 5, valid: true)
+        let report = s2.refine(many, iteration: 25)
+        check(report.grown == 7 && many.activeCount == 107, "growth splits 7% of the erroring splats")
+        let parent = (0..<100).first { simd_distance(many.mean($0), before[$0]) > 1e-6 }!
+        let child = 100 + (0..<7).first { simd_distance(many.mean(100 + $0) + (many.mean(parent) - before[parent]), before[parent]) < 1e-5 && true }!
+        let offset = many.mean(parent) - before[parent]
+        let tau = Float(25) / 1000
+        let expectedOpacity = 0.6 * (1 / (1 + exp(-2))) - 0.004 * (1 - tau)
+        let opacity = 1 / (1 + exp(-q[Int(many.layout.opacities) + parent]))
+        check(abs(simd_length(offset) - 0.1) < 1e-4 && simd_distance(many.mean(child), before[parent] - offset) < 1e-5
+              && abs(exp(q[Int(many.layout.scales) + 3 * parent]) - 0.1 * (1 - 0.002 * (1 - tau))) < 1e-4
+              && abs(opacity - expectedOpacity) < 1e-4,
+              "long-axis split moves parent and child ±0.5 σ, halves the long axis and fades opacity to 60%")
+        // Prune + replacement reuses the freed rows before appending.
+        for i in 0..<10 { q[Int(many.layout.opacities) + i] = -8 }
+        for i in 0..<many.count { many.stat(GaussianStats.errorMax)[i] = 0; many.stat(GaussianStats.visibility)[i] = 1 }
+        let countBefore = many.count
+        let r2 = s2.refine(many, iteration: 50)
+        check(r2.pruned == 10 && r2.replaced == 10 && many.count == countBefore && many.activeCount == countBefore,
+              "soft-pruned slots are refilled by replacement splits without growing the buffers")
+        // Growth ramp: the ceiling rises linearly from the starting count to the cap at growUntil.
+        var ramp = MRNFStrategy(schedule: MRNFSchedule(iterations: 1000), maxGaussians: 1000)
+        ramp.growthStart = 200
+        let until = ramp.schedule.growUntil
+        check(ramp.growthCeiling(at: 0, capacity: 4096) == 200 && ramp.growthCeiling(at: until / 2, capacity: 4096) == 600
+              && ramp.growthCeiling(at: until, capacity: 4096) == 1000 && ramp.growthCeiling(at: until / 2, capacity: 400) == 300,
+              "growth ramp reaches the cap at the end of the growth phase and never exceeds the capacity")
+        // 600 erroring splats want 42 splits (7%); the ramp allows only 620 - 600 at t = 25.
+        let rampModel = try GaussianModel(metal: metal, capacity: 1024, shDegree: 0)
+        rampModel.initialize(positions: (0..<600).map { SIMD3(Float($0 % 30) * 0.1, Float($0 / 30) * 0.1, 0) },
+                             colors: Array(repeating: SIMD3(0.5, 0.5, 0.5), count: 600))
+        let rp = rampModel.floats(rampModel.params)
+        for i in 0..<600 {
+            rp[Int(rampModel.layout.opacities) + i] = 2
+            rampModel.stat(GaussianStats.errorMax)[i] = 1; rampModel.stat(GaussianStats.visibility)[i] = 1
+        }
+        var ramped = MRNFStrategy(schedule: MRNFSchedule(iterations: 1000), maxGaussians: 1000)
+        ramped.bounds = MRNFBounds(center: SIMD3(1.5, 1, 0), maxExtent: 5, medianSize: 5, valid: true)
+        ramped.growthStart = 600
+        let t0 = ramped.schedule.refineEvery
+        let early = ramped.refine(rampModel, iteration: t0)
+        check(ramped.growthCeiling(at: t0, capacity: 1024) == 620 && early.grown == 20 && rampModel.activeCount == 620,
+              "with the ramp an early refine grows only to its ceiling (\(early.grown) of 42 wanted)")
+        // Relocation at the cap: 1,000 Gaussians fill a 1,000 cap. 40 contribute almost nothing
+        // in the views that saw them, 100 cover pixels with above-average error; 20 of the low
+        // ones were seen by only 2 views (too little evidence to judge).
+        let full = try GaussianModel(metal: metal, capacity: 1024, shDegree: 0)
+        full.initialize(positions: (0..<1000).map { SIMD3(Float($0 % 40) * 0.1, Float($0 / 40) * 0.1, 0) },
+                        colors: Array(repeating: SIMD3(0.5, 0.5, 0.5), count: 1000))
+        let fp = full.floats(full.params)
+        func setWindow() {
+            for i in 0..<1000 {
+                fp[Int(full.layout.opacities) + i] = 2
+                let few = i >= 960 && i < 980
+                full.stat(GaussianStats.views)[i] = few ? 2 : 6
+                full.stat(GaussianStats.visibility)[i] = i >= 940 && i < 980 ? 0.01 : 6
+                full.stat(GaussianStats.errorSum)[i] = i < 100 ? 12 : 3
+            }
+        }
+        var relocating = MRNFStrategy(schedule: MRNFSchedule(iterations: 20_000), maxGaussians: 1000)
+        relocating.bounds = MRNFBounds(center: SIMD3(2, 1.25, 0), maxExtent: 5, medianSize: 5, valid: true)
+        let step = relocating.schedule.refineEvery
+        setWindow()
+        let first = relocating.refine(full, iteration: step, relocate: true)
+        setWindow()
+        let second = relocating.refine(full, iteration: 2 * step, relocate: true)
+        let lowest = full.stat(GaussianStats.lowWindows)
+        check(first.relocated == 0 && first.judged == 980 && first.receivers == 100 && lowest[965] == 0,
+              "relocation waits for a second low window and ignores Gaussians seen by too few views")
+        check(second.relocated == 4 && second.donors == 20 && full.activeCount == 1000 && second.grown == 0,
+              "relocation moves at most 0.5% of the cap per refine, from the lowest contributors, without growing (\(second.relocated) moved)")
+        var quiet = relocating
+        let quietModel = full
+        setWindow()
+        for i in 0..<100 { quietModel.stat(GaussianStats.errorSum)[i] = 3 }
+        let none = quiet.refine(quietModel, iteration: 3 * step, relocate: true)
+        check(none.relocated == 0 && none.receivers == 0, "nothing moves when no Gaussian is under-fit")
+        check(relocating.relocationCandidates(full, guidance: Array(repeating: 1, count: full.count),
+                                              iteration: relocating.schedule.stopRefine).donors.isEmpty,
+              "relocation tapers to zero at the end of refinement")
+        // Checkpoints written before the ramp decode without it.
+        var legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ramp)) as! [String: Any]
+        legacy.removeValue(forKey: "growthStart")
+        let decoded = try JSONDecoder().decode(MRNFStrategy.self, from: JSONSerialization.data(withJSONObject: legacy))
+        check(decoded.growthStart == nil && decoded.growthCeiling(at: 1, capacity: 4096) == 1000,
+              "a strategy saved without the growth ramp decodes and grows as before")
+    }
+
+    /// SOG model files: lossless WebP, stored ZIP, and a trained model written and read back.
+    /// Region quotas: the split of growth by region, the shares, and reclaiming at the cap.
+    static func regionQuotas() throws {
+        check(RegionQuota.allot(10, deficit: [3, 1, 0, 6], available: [100, 100, 100, 2]) == [6, 2, 0, 2]
+              && RegionQuota.allot(10, deficit: [1, 1], available: [2, 3]) == [2, 3]
+              && RegionQuota.allot(5, deficit: [0, 0], available: [4, 4]) == [0, 0],
+              "growth is split by deficit, a region takes at most its candidates, and the rest goes to the others")
+        // Shares: A and B have the same visible area, B twice the scene's error; C is seen by
+        // one photo only; D has visible area but no error at all.
+        let bounds = MRNFBounds(center: SIMD3(2, 0, 0), maxExtent: 2, medianSize: 4, valid: true)
+        var shareQuota = RegionQuota(bounds: bounds)!
+        let (a, b, c, d) = (0, 1, 2, 3)
+        shareQuota.area[a] = 100; shareQuota.area[b] = 100; shareQuota.area[c] = 100; shareQuota.area[d] = 100
+        for r in [a, b, c, d] { shareQuota.support[r] = 0.5 }
+        shareQuota.support[c] = 0.01
+        shareQuota.error[a] = 1; shareQuota.error[b] = 3; shareQuota.error[c] = 1; shareQuota.error[d] = 0
+        let shares = shareQuota.shares(trainingViews: 100)
+        let sum = shares.reduce(0, +)
+        check(abs(sum - 1) < 1e-4 && shares[b] > shares[a] && shares[a] > shares[c] && shares[d] > 0
+              && shares[d] >= 0.5 * shares[a] * 0.99 && shares.enumerated().allSatisfy { [a, b, c, d].contains($0.offset) || $0.element == 0 },
+              "shares follow the visible area, give complex regions more, keep a base for low-error regions and scale down weak photo support")
+        // Growth: 500 small splats with high errorMax at x ≈ 0 and 100 larger ones at x ≈ 4 cover
+        // the same visible area with the same error. MRNF picks parents by errorMax, so nearly all
+        // splits go left; with quotas the right region, far below its half, gets them.
+        func twoClusters() throws -> GaussianModel {
+            let m = try GaussianModel(metal: metal, capacity: 2048, shDegree: 0)
+            let left: [SIMD3<Float>] = (0..<500).map { index in
+                SIMD3(Float(index % 25) * 0.004, Float(index / 25) * 0.004, 0)
+            }
+            let right: [SIMD3<Float>] = (0..<100).map { index in
+                SIMD3(4 + Float(index % 10) * 0.004, Float(index / 10) * 0.004, 0)
+            }
+            m.initialize(positions: left + right, colors: Array(repeating: SIMD3(0.5, 0.5, 0.5), count: 600))
+            let mp = m.floats(m.params)
+            for i in 0..<600 {
+                mp[Int(m.layout.opacities) + i] = 2
+                let isLeft = i < 500
+                m.stat(GaussianStats.visibility)[i] = isLeft ? 1 : 5
+                m.stat(GaussianStats.errorSum)[i] = isLeft ? 1 : 5
+                m.stat(GaussianStats.errorMax)[i] = isLeft ? 10 : 1
+                m.stat(GaussianStats.views)[i] = 6
+            }
+            return m
+        }
+        func rightCount(_ m: GaussianModel) -> Int {
+            let mp = m.floats(m.params), active = m.stat(GaussianStats.active)
+            return (0..<m.count).filter { active[$0] > 0.5 && mp[Int(m.layout.means) + 3 * $0] > 2 }.count
+        }
+        var results: [RegionMode: (grown: Int, right: Int)] = [:]
+        for mode in [RegionMode.off, .quota] {
+            let m = try twoClusters()
+            var grow = MRNFStrategy(schedule: MRNFSchedule(iterations: 1000), maxGaussians: 2000)
+            grow.bounds = bounds
+            grow.growthStart = 600
+            grow.trainingViews = 50
+            let report = grow.refine(m, iteration: grow.schedule.refineEvery, regionMode: mode)
+            results[mode] = (report.grown, rightCount(m))
+        }
+        let plain = results[.off]!, quota = results[.quota]!
+        check(plain.grown == 42 && quota.grown == 42 && plain.right < 110 && quota.right >= 140,
+              "quotas send growth to the region below its share (right region \(plain.right) → \(quota.right) of \(100 + quota.grown))")
+        // Reclaim at the cap: 800 Gaussians at x ≈ 0 and 200 at x ≈ 4 fill a 1,000 cap with the
+        // same visible area; 20 low contributors and 50 under-fit Gaussians in each region. Only
+        // the crowded left region gives slots, and only the right one receives them.
+        let full = try GaussianModel(metal: metal, capacity: 1024, shDegree: 0)
+        let left: [SIMD3<Float>] = (0..<800).map { index in
+            SIMD3(Float(index % 40) * 0.004, Float(index / 40) * 0.004, 0)
+        }
+        let right: [SIMD3<Float>] = (0..<200).map { index in
+            SIMD3(4 + Float(index % 20) * 0.004, Float(index / 20) * 0.004, 0)
+        }
+        full.initialize(positions: left + right, colors: Array(repeating: SIMD3(0.5, 0.5, 0.5), count: 1000))
+        let fp = full.floats(full.params)
+        func setWindow() {
+            for i in 0..<1000 {
+                fp[Int(full.layout.opacities) + i] = 2
+                let isLeft = i < 800, local = isLeft ? i : i - 800
+                let visibility: Float = local < 20 ? 0.01 : (isLeft ? 1.5 : 6)
+                full.stat(GaussianStats.views)[i] = 6
+                full.stat(GaussianStats.visibility)[i] = visibility
+                full.stat(GaussianStats.errorSum)[i] = local >= 20 && local < 70 ? 2 * visibility : 0.5 * visibility
+                full.stat(GaussianStats.errorMax)[i] = 0
+            }
+        }
+        var reclaiming = MRNFStrategy(schedule: MRNFSchedule(iterations: 20_000), maxGaussians: 1000)
+        reclaiming.bounds = bounds
+        reclaiming.trainingViews = 100
+        let step = reclaiming.schedule.refineEvery
+        setWindow()
+        _ = reclaiming.refine(full, iteration: step, regionMode: .quotaReclaim)
+        let rightBefore = rightCount(full)
+        setWindow()
+        let second = reclaiming.refine(full, iteration: 2 * step, regionMode: .quotaReclaim)
+        let active = full.stat(GaussianStats.active)
+        check(second.relocated > 0 && full.activeCount == 1000 && rightCount(full) == rightBefore + second.relocated
+              && (800..<820).allSatisfy { active[$0] > 0.5 },
+              "at the cap, slots move only from the region over its quota to the one below it (\(second.relocated) moved)")
+        var plainCap = MRNFStrategy(schedule: MRNFSchedule(iterations: 20_000), maxGaussians: 1000)
+        plainCap.bounds = bounds
+        plainCap.trainingViews = 100
+        let untouched = try twoClusters()
+        _ = plainCap.refine(untouched, iteration: step, regionMode: .quotaReclaim)
+        check(plainCap.refine(untouched, iteration: 2 * step, regionMode: .quotaReclaim).relocated == 0,
+              "nothing is reclaimed below the cap")
+        // Checkpoints keep the region statistics.
+        let decoded = try JSONDecoder().decode(MRNFStrategy.self, from: JSONEncoder().encode(reclaiming))
+        check(decoded.regions == reclaiming.regions && decoded.regions != nil, "region statistics survive a checkpoint")
+    }
+
+    static func sogFormat() throws {
+        // WebP: exact texels through ImageIO, with and without alpha.
+        var rng = SplitMix64(seed: 17)
+        var exact = true
+        for opaque in [true, false] {
+            let w = 37, h = 23
+            var rgba = (0..<(w * h * 4)).map { _ in UInt8(truncatingIfNeeded: rng.next()) }
+            if opaque { for i in 0..<(w * h) { rgba[4 * i + 3] = 255 } }
+            let decoded = try GaussianSOG.decodeRGBA(try WebPLossless.encode(rgba: rgba, width: w, height: h))
+            exact = exact && decoded.rgba == rgba && decoded.width == w && decoded.height == h
+        }
+        let smooth: [UInt8] = (0..<(256 * 64 * 4)).map { (i: Int) -> UInt8 in UInt8(truncatingIfNeeded: i / 64) }
+        let smoothFile = try WebPLossless.encode(rgba: smooth, width: 256, height: 64)
+        let smoothBack = try GaussianSOG.decodeRGBA(smoothFile).rgba
+        check(exact && smoothBack == smooth && smoothFile.count < smooth.count / 4,
+              "lossless WebP decodes to the same texels, alpha included, and compresses smooth data")
+        // ZIP: our stored archives read back, and system zip tools agree both ways.
+        let entries: [(name: String, data: Data)] = [("meta.json", Data("{\"a\":1}".utf8)), ("b.webp", smoothFile)]
+        let archive = StoredZip.archive(entries)
+        let back = try StoredZip.entries(archive)
+        var interop = true
+        let archiveURL = temp.appendingPathComponent("stored.zip")
+        try archive.write(to: archiveURL)
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/unzip") && FileManager.default.isExecutableFile(atPath: "/usr/bin/zip") {
+            func tool(_ path: String, _ args: [String], in dir: URL) throws -> Int32 {
+                let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+                p.currentDirectoryURL = dir; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+                try p.run(); p.waitUntilExit(); return p.terminationStatus
+            }
+            let folder = temp.appendingPathComponent("zipdir", isDirectory: true)
+            try? FileManager.default.removeItem(at: folder)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data(smooth).write(to: folder.appendingPathComponent("raw.bin"))
+            let deflated = temp.appendingPathComponent("deflated.zip")
+            try? FileManager.default.removeItem(at: deflated)
+            let tested = try tool("/usr/bin/unzip", ["-tq", archiveURL.path], in: temp) == 0
+            let zipped = try tool("/usr/bin/zip", ["-q", "-9", "-X", deflated.path, "raw.bin"], in: folder) == 0
+            let inflated = zipped ? try StoredZip.entries(Data(contentsOf: deflated))["raw.bin"] : nil
+            interop = tested && inflated == Data(smooth)
+        }
+        check(back["meta.json"] == entries[0].data && back["b.webp"] == smoothFile && interop,
+              "stored ZIP archives round-trip, pass unzip's test, and deflated archives from zip read back")
+        check(GaussianSOG.paletteSize(600_000) == 65_536 && GaussianSOG.paletteSize(10_000) == 8_192 && GaussianSOG.paletteSize(500) == 500
+              && GaussianSOG.textureSize(600_000) == (776, 776) && GaussianSOG.textureSize(5) == (4, 4),
+              "SOG palette and texture sizes follow the format (1,024 × a power of two ≤ n / 1,024, at most 65,536)")
+        // A trained SH 3 model through SOG and back.
+        let scan = try writeScan(name: "sog", frames: 24)
+        let t = try trainer(scan.directory, config(iterations: 400, holdOut: 6, sh: 3))
+        _ = try train(t, until: 400)
+        let views = t.dataset.trainFrames
+        let before = try meanPSNR(t, frames: views)
+        let rows = t.model.liveRows
+        let p = t.model.floats(t.model.params), L = t.model.layout
+        let original = rows.map { row in (mean: SIMD3(p[Int(L.means) + 3 * row], p[Int(L.means) + 3 * row + 1], p[Int(L.means) + 3 * row + 2]),
+                                          quat: simd_normalize(SIMD4(p[Int(L.quats) + 4 * row], p[Int(L.quats) + 4 * row + 1],
+                                                                     p[Int(L.quats) + 4 * row + 2], p[Int(L.quats) + 4 * row + 3])),
+                                          opacity: 1 / (1 + exp(-p[Int(L.opacities) + row]))) }
+        let url = temp.appendingPathComponent("model.sog")
+        var steps: [(step: GaussianSOG.WriteStep, fraction: Double)] = []
+        let report = try GaussianSOG.write(t.model, to: url, metal: metal) { steps.append(($0, $1)) }
+        // Progress: never decreasing from 0 to 1, through the steps in order.
+        let fractions = steps.map(\.fraction)
+        let order = steps.map { step -> Int in
+            switch step.step {
+            case .arranging: return 0
+            case .clustering: return 1
+            case .encoding: return 2
+            case .archiving: return 3
+            }
+        }
+        let passes = Set(steps.compactMap { if case .clustering(let pass, let of) = $0.step { return "\(pass)/\(of)" }; return nil })
+        let images = Set(steps.compactMap { if case .encoding(let image, let of) = $0.step { return "\(image)/\(of)" }; return nil })
+        check(fractions.first == 0 && fractions.last == 1 && zip(fractions, fractions.dropFirst()).allSatisfy { $0 <= $1 }
+              && zip(order, order.dropFirst()).allSatisfy { $0 <= $1 }
+              && passes == Set((1...GaussianSOG.kMeansIterations + 1).map { "\($0)/\(GaussianSOG.kMeansIterations + 1)" })
+              && images == Set((1...7).map { "\($0)/7" }),
+              "SOG write progress runs from 0 to 1 through arranging, \(passes.count) k-means passes, 7 images and the archive (\(steps.count) updates)")
+        let meta = try JSONDecoder().decode(GaussianSOG.Meta.self, from: try StoredZip.entries(Data(contentsOf: url))["meta.json"]!)
+        let loaded = try GaussianModel(metal: metal, capacity: t.model.capacity, shDegree: 3, trainable: false)
+        try GaussianSOG.read(url, into: loaded)
+        // Rows come back in Morton order: match each original Gaussian to its nearest read-back one.
+        let q = loaded.floats(loaded.params)
+        let back3 = (0..<loaded.count).map { SIMD3(q[Int(L.means) + 3 * $0], q[Int(L.means) + 3 * $0 + 1], q[Int(L.means) + 3 * $0 + 2]) }
+        let index = Dictionary(grouping: back3.indices) { i -> SIMD3<Int32> in SIMD3<Int32>(Int32((back3[i].x * 50).rounded(.down)), Int32((back3[i].y * 50).rounded(.down)), Int32((back3[i].z * 50).rounded(.down))) }
+        var worstMean: Float = 0, worstAngle: Float = 0, worstOpacity: Float = 0
+        for o in original {
+            let cell = SIMD3<Int32>(Int32((o.mean.x * 50).rounded(.down)), Int32((o.mean.y * 50).rounded(.down)), Int32((o.mean.z * 50).rounded(.down)))
+            var best = -1, bestDistance = Float.infinity
+            for dx in -1...1 { for dy in -1...1 { for dz in -1...1 {
+                for i in index[cell &+ SIMD3(Int32(dx), Int32(dy), Int32(dz))] ?? [] {
+                    let d = simd_distance(back3[i], o.mean)
+                    if d < bestDistance { bestDistance = d; best = i }
+                }
+            } } }
+            guard best >= 0 else { worstMean = .infinity; continue }
+            worstMean = max(worstMean, bestDistance)
+            let rq = simd_normalize(SIMD4(q[Int(L.quats) + 4 * best], q[Int(L.quats) + 4 * best + 1], q[Int(L.quats) + 4 * best + 2], q[Int(L.quats) + 4 * best + 3]))
+            worstAngle = max(worstAngle, 2 * acos(min(1, abs(simd_dot(rq, o.quat)))) * 180 / .pi)
+            worstOpacity = max(worstOpacity, abs(1 / (1 + exp(-q[Int(L.opacities) + best])) - o.opacity))
+        }
+        let extent = original.map(\.mean).reduce(SIMD3<Float>(repeating: 0)) { simd_max($0, simd_abs($1)) }.max()
+        try GaussianSOG.read(url, into: t.model)
+        let after = try meanPSNR(t, frames: views)
+        print(String(format: "  %d Gaussians, %d bytes (%.1f× smaller than PLY), palette %d; worst position %.2e m of %.1f m, rotation %.2f°, opacity %.4f; training views %.2f -> %.2f dB",
+                     report.gaussians, report.bytes, Double(rows.count * 62 * 4) / Double(report.bytes), report.paletteEntries,
+                     worstMean, extent, worstAngle, worstOpacity, before, after))
+        check(meta.version == 2 && meta.count == rows.count && meta.shN?.bands == 3 && meta.shN?.count == report.paletteEntries
+              && loaded.count == rows.count && worstMean < 2e-4 * max(1, extent) * 8 && worstAngle < 1.0 && worstOpacity <= 0.6 / 255
+              && after > before - 1.0,
+              "a trained SH 3 model survives SOG: positions, rotations and opacities within their quantisation, renders within 1 dB")
+    }
+
+    static func exportFrame() throws {
+        let scan = try writeScan(name: "export", frames: 8)
+        let t = try trainer(scan.directory, config(iterations: 40, sh: 3))
+        _ = try train(t, until: 40)
+        let url = temp.appendingPathComponent("export.ply")
+        try GaussianExport.writePLY(t.model, to: url, comment: "test")
+        let loaded = try GaussianModel(metal: metal, capacity: t.model.capacity, shDegree: 3, trainable: false)
+        let n = try GaussianExport.readPLY(url, into: loaded)
+        var worst: Float = 0
+        let rows = t.model.liveRows
+        let a = t.model.floats(t.model.params), b = loaded.floats(loaded.params)
+        for (k, row) in rows.enumerated() {
+            for (offset, width) in t.model.layout.groups where width > 0 && offset != Int(t.model.layout.quats) {
+                for j in 0..<width { worst = max(worst, abs(a[offset + row * width + j] - b[offset + k * width + j])) }
+            }
+            let qa = simd_normalize(SIMD4(a[Int(t.model.layout.quats) + 4 * row], a[Int(t.model.layout.quats) + 4 * row + 1],
+                                          a[Int(t.model.layout.quats) + 4 * row + 2], a[Int(t.model.layout.quats) + 4 * row + 3]))
+            let qb = SIMD4(b[Int(loaded.layout.quats) + 4 * k], b[Int(loaded.layout.quats) + 4 * k + 1], b[Int(loaded.layout.quats) + 4 * k + 2], b[Int(loaded.layout.quats) + 4 * k + 3])
+            worst = max(worst, min(simd_length(qa - qb), simd_length(qa + qb)))
+        }
+        check(n == rows.count && worst < 1e-5, "PLY export round-trips every parameter (max difference \(worst))")
+        // The exported frame is the COLMAP export frame: render the flipped model directly (no
+        // un-flip) with the flipped camera; it must match the ARKit-frame render.
+        let raw = try GaussianModel(metal: metal, capacity: t.model.capacity, shDegree: 3, trainable: false)
+        let info = try GaussianExport.readHeader(url)
+        let data = try Data(contentsOf: url)
+        raw.initialize(positions: [], colors: [])
+        let rp = raw.floats(raw.params), L = raw.layout
+        data.withUnsafeBytes { bytes in
+            for row in 0..<info.count {
+                let base = info.headerBytes + row * info.names.count * 4
+                func f(_ k: Int) -> Float { bytes.loadUnaligned(fromByteOffset: base + 4 * k, as: Float.self) }
+                for k in 0..<3 { rp[Int(L.means) + 3 * row + k] = f(k); rp[Int(L.sh0) + 3 * row + k] = f(6 + k) }
+                for c in 0..<3 { for k in 0..<15 { rp[Int(L.shN) + row * 45 + k * 3 + c] = f(9 + c * 15 + k) } }
+                rp[Int(L.opacities) + row] = f(54)
+                for k in 0..<3 { rp[Int(L.scales) + 3 * row + k] = f(55 + k) }
+                for k in 0..<4 { rp[Int(L.quats) + 4 * row + k] = f(58 + k) }
+            }
+        }
+        raw.restore(rowCount: info.count, adamStep: 0)
+        let frame = t.dataset.frames[3]
+        let w2c = GaussianCamera.worldToCamera(arkitRowMajorC2W: frame.transform)
+        let flip = simd_double4x4(diagonal: SIMD4(1, -1, -1, 1))
+        func render(_ model: GaussianModel, _ m: simd_double4x4) throws -> [UInt8] {
+            let camera = GaussianCamera(worldToCamera: m, fx: frame.intrinsics.fx, fy: frame.intrinsics.fy, cx: frame.intrinsics.cx,
+                                        cy: frame.intrinsics.cy, width: frame.intrinsics.width, height: frame.intrinsics.height, mipFilter: true)
+            return [UInt8](try t.renderer.render(model: model, camera: camera, shDegree: 3, isp: nil)!.pixels)
+        }
+        let arkit = try render(t.model, w2c), colmap = try render(raw, w2c * flip)
+        let diff = zip(arkit, colmap).map { abs(Int($0) - Int($1)) }.max() ?? 255
+        check(diff <= 2, "the exported model in the COLMAP frame renders like the ARKit model (max pixel difference \(diff))")
+    }
+
+    /// LiDAR depth seeds only empty surfaces, on the measured surface, with the photo's colour,
+    /// one per cell, within the limit, and skips far low-confidence depth.
+    static func depthSeeding() throws {
+        let dir = temp.appendingPathComponent("scan_depthseed")
+        try? FileManager.default.removeItem(at: dir)
+        for sub in ["images", "depth"] { try FileManager.default.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true) }
+        let w = 64, h = 48
+        // A wall 2 m ahead; the bottom-right quadrant is low confidence, its right half 5 m away.
+        var depth = [Float](repeating: 2, count: w * h), confidence = [UInt8](repeating: 2, count: w * h)
+        for y in (h / 2)..<h { for x in (w / 2)..<w { confidence[y * w + x] = 0; if x >= 3 * w / 4 { depth[y * w + x] = 5 } } }
+        try depth.withUnsafeBytes { try Data($0).write(to: dir.appendingPathComponent("depth/f1_depth.bin")) }
+        try Data(confidence).write(to: dir.appendingPathComponent("depth/f1_conf.bin"))
+        try writeJPEG([UInt8]((0..<(w * h)).flatMap { _ in [230, 30, 30, 255] as [UInt8] }), width: w, height: h,
+                      to: dir.appendingPathComponent("images/f1.jpg"))
+        var record = FrameRecord(id: 1, timestamp: 0, transform: arkitPose(eye: .zero, target: SIMD3(0, 0, -1)),
+                                 intrinsics: CameraIntrinsics(fx: 50, fy: 50, cx: 32, cy: 24, width: w, height: h),
+                                 exposureDuration: 0.01, exposureOffsetEV: 0, iso: 0, estimatedBlurPx: 0, imageFile: "f1.jpg")
+        record.depthFile = "f1_depth.bin"; record.confidenceFile = "f1_conf.bin"; record.depthWidth = w; record.depthHeight = h
+        // The saved cloud already covers the left half of the wall.
+        var existing: [CloudPoint] = []
+        for i in 0..<130 { for j in 0..<100 {
+            existing.append(CloudPoint(x: -1.3 + Float(i) * 0.01, y: -0.99 + Float(j) * 0.02, z: -2, r: 0, g: 0, b: 255))
+        } }
+        let seeds = TrainingDataset.depthSeeds(records: [record], directory: dir, existing: existing, limit: 100_000, stride: 2)
+        let voxel: Float = 0.04
+        let cells = Set(seeds.map { SIMD3(Int(($0.x / voxel).rounded(.down)), Int(($0.y / voxel).rounded(.down)), Int(($0.z / voxel).rounded(.down))) })
+        let onWall = seeds.allSatisfy { abs($0.z + 2) < 0.01 && $0.x > -0.05 }
+        let red = seeds.allSatisfy { $0.r > 180 && $0.g < 90 && $0.b < 90 }
+        let far = seeds.contains { $0.z < -3 }
+        let limited = TrainingDataset.depthSeeds(records: [record], directory: dir, existing: existing, limit: 7, stride: 2).count
+        print("  \(seeds.count) depth seeds in \(cells.count) cells")
+        check(!seeds.isEmpty && onWall && red && cells.count == seeds.count && !far && limited == 7,
+              "depth seeds fill only empty cells, on the measured surface, coloured from the photo, within the limit, without far low-confidence depth")
+        // A long capture: 8 photos of walls 5 m apart. With room for fewer seeds than empty cells,
+        // every photo's wall still gets some (interleaved photos, thinned on a coarser grid).
+        let walk = (0..<8).map { k -> FrameRecord in
+            var r = record
+            r.id = 10 + k
+            r.transform = arkitPose(eye: SIMD3(Double(k) * 5, 0, 0), target: SIMD3(Double(k) * 5, 0, -1))
+            return r
+        }
+        let spread = TrainingDataset.depthSeeds(records: walk, directory: dir, existing: [], limit: 400, stride: 2)
+        let walls = Set(spread.map { Int(($0.x / 5).rounded()) })
+        print("  long capture: \(spread.count) seeds on \(walls.count) of 8 walls")
+        check(spread.count <= 400 && spread.count > 300 && walls.count == 8,
+              "with more empty cells than the limit, depth seeds spread over the whole capture, not only its first photos")
+        // Close range: a tabletop 0.3 m away (low-confidence background 1.5 m away in one
+        // quadrant). Room-scale 4 cm cells give the surface few seeds and take the background;
+        // cells and range scaled to the working distance (1/4) cover the surface and skip it.
+        let nearDir = temp.appendingPathComponent("scan_depthseed_near")
+        try? FileManager.default.removeItem(at: nearDir)
+        for sub in ["images", "depth"] { try FileManager.default.createDirectory(at: nearDir.appendingPathComponent(sub), withIntermediateDirectories: true) }
+        var nearDepth = [Float](repeating: 0.3, count: w * h), nearConfidence = [UInt8](repeating: 2, count: w * h)
+        for y in (h / 2)..<h { for x in (w / 2)..<w { nearConfidence[y * w + x] = 0; nearDepth[y * w + x] = 1.5 } }
+        try nearDepth.withUnsafeBytes { try Data($0).write(to: nearDir.appendingPathComponent("depth/f1_depth.bin")) }
+        try Data(nearConfidence).write(to: nearDir.appendingPathComponent("depth/f1_conf.bin"))
+        try FileManager.default.copyItem(at: dir.appendingPathComponent("images/f1.jpg"), to: nearDir.appendingPathComponent("images/f1.jpg"))
+        let scale = TrainingFrameSelector.metricScale(workingDistance: 0.3)
+        let roomCells = TrainingDataset.depthSeeds(records: [record], directory: nearDir, existing: [], limit: 100_000, stride: 2)
+        let nearCells = TrainingDataset.depthSeeds(records: [record], directory: nearDir, existing: [], limit: 100_000,
+                                                   voxel: 0.04 * scale, lowConfidenceRange: 4 * scale, stride: 2)
+        func surface(_ seeds: [CloudPoint]) -> Int { seeds.filter { abs($0.z + 0.3) < 0.01 }.count }
+        print("  close range: \(surface(roomCells)) surface seeds and \(roomCells.count - surface(roomCells)) background with 4 cm cells, \(surface(nearCells)) and \(nearCells.count - surface(nearCells)) with \(Int(40 * scale)) mm")
+        check(surface(nearCells) >= 8 * surface(roomCells) && nearCells.count == surface(nearCells) && roomCells.count > surface(roomCells),
+              "at 0.3 m, cells scaled to the working distance give the surface many more seeds and skip far low-confidence background")
+        // The seed budget follows the Gaussian cap; depth seeds fill what the cloud leaves.
+        var standard = GaussianTrainingConfiguration.preset(.standard)
+        standard.maxGaussians = 600_000
+        var enhance = standard
+        enhance.enhancedFrom = 1_000
+        check(standard.seedBudget == 300_000 && standard.depthSeedLimit(cloudPoints: 250_000) == 150_000
+              && standard.depthSeedLimit(cloudPoints: 20_000) == 280_000 && enhance.depthSeedLimit(cloudPoints: 0) == 0,
+              "the seed budget is half the Gaussian cap, with at least a quarter for depth seeds")
+        // The prototype opens with the Quick preset: 960 px, 4,000 iterations and 300k Gaussians.
+        let quick = GaussianTrainingConfiguration.preset(.quick)
+        check(quick.longEdge == 960 && quick.iterations == 4_000 && quick.maxGaussians == 300_000,
+              "the Quick prototype preset is 960 px, 4,000 iterations and 300,000 Gaussians")
+        // Iterations: at least the preset's, and enough for about 12 / 30 / 60 updates per photo.
+        typealias Config = GaussianTrainingConfiguration
+        check(Config.automaticIterations(.standard, trainingPhotos: 250) == 10_000
+              && Config.automaticIterations(.standard, trainingPhotos: 1_000) == 30_000
+              && Config.automaticIterations(.quick, trainingPhotos: 1_000) == 12_000
+              && Config.automaticIterations(.high, trainingPhotos: 401) == 25_000
+              && Config.automaticIterations(.high, trainingPhotos: nil) == 20_000,
+              "the automatic iteration count grows with the number of training photos")
+    }
+
+    /// The left wall has no seeds: splitting neighbours reaches it slowly and blurrily; hole
+    /// filling grows Gaussians there from the empty, erroring pixels (depth from covered pixels
+    /// nearby, as without LiDAR).
+    /// Five photos of a textured wall 2 m away, 5 cm apart: one motion-blurred, one 1.4× brighter,
+    /// one with sensor noise; a sixth photo sees another wall alone. Only the blurred photo has a
+    /// clearly sharper peer; brightness and noise are not read as detail; a photo without peers
+    /// keeps weight 1.
+    static func covisibleSharpness() throws {
+        let dir = temp.appendingPathComponent("scan_sharpness")
+        try? FileManager.default.removeItem(at: dir)
+        for sub in ["images", "depth"] { try FileManager.default.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true) }
+        let W = 640, H = 480, dw = 256, dh = 192
+        let k = CameraIntrinsics(fx: 500, fy: 500, cx: 320, cy: 240, width: W, height: H)
+        func texture(_ x: Double, _ y: Double) -> Double {
+            0.45 + 0.12 * sin(x * 230) * cos(y * 190) + 0.1 * sin(x * 510 + y * 80) + 0.08 * cos(y * 640 - x * 150) + 0.05 * sin(x * 1300) * sin(y * 1100)
+        }
+        var rng = LCGNoise(state: 7)
+        try [Float](repeating: 2, count: dw * dh).withUnsafeBytes { try Data($0).write(to: dir.appendingPathComponent("depth/d.bin")) }
+        var frames: [TrainingFrame] = []
+        for i in 0..<6 {
+            let eye = i == 5 ? SIMD3<Double>(20, 0, 0) : SIMD3(Double(i) * 0.05, 0, 0)
+            var grey = [Double](repeating: 0, count: W * H)
+            for y in 0..<H { for x in 0..<W {
+                grey[y * W + x] = texture(eye.x + (Double(x) + 0.5 - 320) / 500 * 2, -(Double(y) + 0.5 - 240) / 500 * 2)
+            } }
+            if i == 2 {
+                // 9 px horizontal motion blur.
+                let sharp = grey
+                for p in 0..<(W * H) {
+                    let row = p / W * W, x = p % W
+                    var sum = 0.0
+                    for dx in -4...4 { sum += sharp[row + min(W - 1, max(0, x + dx))] }
+                    grey[p] = sum / 9
+                }
+            }
+            if i == 3 { grey = grey.map { $0 * 1.4 } }
+            if i == 4 { grey = grey.map { $0 + 0.02 * rng.gaussian() } }
+            let rgba = grey.flatMap { v -> [UInt8] in let c = UInt8(max(0, min(255, (v * 255).rounded()))); return [c, c, c, 255] }
+            try writeJPEG(rgba, width: W, height: H, to: dir.appendingPathComponent("images/f\(i).jpg"))
+            frames.append(TrainingFrame(id: i, imageFile: "f\(i).jpg", intrinsics: k, transform: arkitPose(eye: eye, target: eye + SIMD3(0, 0, -1)),
+                                        captureEV: nil, isValidation: false, depthFile: "d.bin", depthWidth: dw, depthHeight: dh))
+        }
+        let scores = CovisibleSharpness.scores(frames: frames, directory: dir)
+        let d = (0..<6).map { scores[$0]?.deficit ?? -1 }
+        print("  deficits " + d.map { String(format: "%.2f", $0) }.joined(separator: " ") + ", peers \((0..<6).map { scores[$0]?.peers ?? -1 })")
+        check(d[2] > 0.5 && [0, 1, 3, 4].allSatisfy { d[$0] < 0.15 } && d[5] == 0 && scores[5]?.peers == 0,
+              "the blurred photo alone has a sharper photo of its surface; brightness, noise and a photo without peers do not count")
+        let weights = CovisibleSharpness.weights(scores, count: 7, strength: 1, floor: 0.25)
+        check(weights[2] < 0.7 && weights[2] >= 0.25 && weights[5] == 1 && weights[6] == 1 && weights[0] > 0.85,
+              "sharpness weights lower the blurred photo within the floor and keep unscored photos at 1")
+    }
+
+    static func holeFilling() throws {
+        let scan = try writeScan(name: "holes", frames: 36, seed: 17)
+        let ply = scan.directory.appendingPathComponent("review.ply")
+        let full = try ScanLibrary.readPLY(ply, limit: 1_000_000)
+        // Empty = the model leaves the pixel uncovered although the photo shows the scene there.
+        func measure(_ t: GaussianTrainer) throws -> (psnr: Double, empty: Double) {
+            var empty = 0.0
+            let pixels = t.dataset.width * t.dataset.height
+            for i in t.dataset.validationFrames {
+                _ = try t.evaluate(frames: [i])
+                let image = t.target.image.contents().bindMemory(to: SIMD4<Float>.self, capacity: pixels)
+                guard let photo = TrainingImageLoader.decode(t.dataset.imageURL(i), width: t.dataset.width, height: t.dataset.height) else { continue }
+                var count = 0
+                for p in 0..<pixels where image[p].w > 0.5 {
+                    let c = SIMD3(Float(photo[4 * p]), Float(photo[4 * p + 1]), Float(photo[4 * p + 2])) / 255
+                    if simd_reduce_max(simd_abs(c - scan.background)) > 0.1 { count += 1 }
+                }
+                empty += Double(count) / Double(pixels)
+            }
+            return (try meanPSNR(t, frames: t.dataset.validationFrames), empty / Double(t.dataset.validationFrames.count))
+        }
+        var reference = config(iterations: 1500, holdOut: 6)
+        reference.holeFilling = false
+        let complete = try measure({ let t = try trainer(scan.directory, reference); _ = try train(t, until: 1500); return t }())
+        try ExportManager.writePLY(full.filter { $0.x > -1.1 }, to: ply)     // the whole left wall
+        // Two seeds each: GPU atomics add in a different order every run, which moves this small
+        // scene's held-out PSNR by a few tenths of a dB.
+        var results: [Bool: (psnr: Double, empty: Double, holes: Int)] = [:]
+        for fill in [false, true] {
+            var sum = (psnr: 0.0, empty: 0.0, holes: 0)
+            for seed: UInt64 in [0x3D65, 0x3D66] {
+                var c = config(iterations: 1500, holdOut: 6)
+                c.holeFilling = fill
+                c.seed = seed
+                let t = try trainer(scan.directory, c)
+                _ = try train(t, until: 1500)
+                let m = try measure(t)
+                sum = (sum.psnr + m.psnr / 2, sum.empty + m.empty / 2, sum.holes + t.holeSeedsAdded)
+            }
+            results[fill] = sum
+        }
+        print(String(format: "  full seed cloud: held-out PSNR %.2f dB, empty scene pixels %.2f%%", complete.psnr, complete.empty * 100))
+        let off = results[false]!, on = results[true]!
+        print(String(format: "  left wall unseeded: held-out PSNR %.2f -> %.2f dB, empty scene pixels %.2f%% -> %.2f%%, %d hole seeds",
+                     off.psnr, on.psnr, off.empty * 100, on.empty * 100, on.holes))
+        check(on.holes > 0 && on.empty <= off.empty && on.psnr > off.psnr + 0.1,
+              "hole filling grows Gaussians where the seed cloud had none (held-out PSNR +\(String(format: "%.2f", on.psnr - off.psnr)) dB, no more empty pixels)")
+    }
+
+    static func convergence() throws {
+        let scan = try writeScan(name: "converge", frames: 36)
+        let t = try trainer(scan.directory, config(iterations: 1500, holdOut: 6))
+        let start = try meanPSNR(t, frames: t.dataset.validationFrames)
+        _ = try train(t, until: 1500)
+        let end = try meanPSNR(t, frames: t.dataset.validationFrames)
+        print("  held-out PSNR \(String(format: "%.2f", start)) -> \(String(format: "%.2f", end)) dB, Gaussians \(t.model.activeCount)")
+        check(end > start + 6 && end > 25, "training converges on held-out views (\(String(format: "%.1f", end)) dB)")
+    }
+
+    static func enhancement() throws {
+        let scan = try writeScan(name: "enhance", frames: 30)
+        let c = config(iterations: 600, pose: true, holdOut: 6, sh: 1)
+        let t = try trainer(scan.directory, c)
+        _ = try train(t, until: 600)
+        let directory = temp.appendingPathComponent("enhance-model", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try GaussianTrainingSession.writeModelFiles(t, into: directory, validation: nil, elapsedSeconds: 1, peakFootprintMB: 1)
+        let views = t.dataset.trainFrames
+        let before = try meanPSNR(t, frames: views), heldBefore = try meanPSNR(t, frames: t.dataset.validationFrames)
+        // Enhance with a higher SH degree: the extra band starts at zero, so it renders as saved.
+        let saved = GaussianExport.metadata(in: directory)!
+        let e = try trainer(scan.directory, config(iterations: 600, pose: true, holdOut: 6, sh: 2)
+            .enhancing(savedIterations: saved.iterations, savedGaussians: saved.gaussians, savedSHDegree: saved.shDegree),
+                            initialize: false)
+        try e.initializeModel(fromSaved: directory)
+        let loaded = try meanPSNR(e, frames: views)
+        let poseError = views.map { max(simd_length(t.poses[$0].rotation - e.poses[$0].rotation),
+                                        simd_length(t.poses[$0].translation - e.poses[$0].translation)) }.max() ?? 1
+        let moved = views.filter { !t.poses[$0].isIdentity }.count
+        print(String(format: "  saved %.3f dB, reloaded %.3f dB, pose difference %.2e over %d refined views", before, loaded, poseError, moved))
+        check(e.iteration == 600 && e.configuration.iterations == 1_200 && e.model.shDegree == 2
+              && e.model.activeCount == t.model.activeCount && loaded > before - 0.5 && moved > 0 && poseError < 1e-6
+              && FileManager.default.fileExists(atPath: directory.appendingPathComponent(GaussianSOG.fileName).path),
+              "a saved SOG model reloads with its refined poses and renders within 0.5 dB of the trained one (SH 1 raised to 2)")
+        // A model saved before SOG (PLY) still reloads exactly.
+        let legacy = temp.appendingPathComponent("enhance-legacy", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+        for name in [GaussianExport.metadataName, GaussianExport.posesName] {
+            try FileManager.default.copyItem(at: directory.appendingPathComponent(name), to: legacy.appendingPathComponent(name))
+        }
+        try GaussianExport.writePLY(t.model, to: legacy.appendingPathComponent(GaussianExport.plyName), comment: "test")
+        let old = try trainer(scan.directory, config(iterations: 600, pose: true, holdOut: 6, sh: 2)
+            .enhancing(savedIterations: saved.iterations, savedGaussians: saved.gaussians, savedSHDegree: saved.shDegree),
+                              initialize: false)
+        try old.initializeModel(fromSaved: legacy)
+        let oldLoaded = try meanPSNR(old, frames: views)
+        print(String(format: "  PLY reloaded %.3f dB", oldLoaded))
+        check(abs(oldLoaded - before) < 0.02, "a model saved as PLY before SOG reloads exactly")
+        _ = try train(e, until: e.configuration.iterations)
+        let heldAfter = try meanPSNR(e, frames: e.dataset.validationFrames)
+        print(String(format: "  held-out %.2f -> %.2f dB after enhancing", heldBefore, heldAfter))
+        check(heldAfter > heldBefore + 0.2, "enhancing continues the saved model's schedule and improves held-out views")
+    }
+
+    static func ppispRecovery() throws {
+        let scan = try writeScan(name: "ppisp", frames: 30, exposureSpread: 0.6, seed: 5)
+        var results: [Bool: Double] = [:]
+        var learned: [Double] = []
+        for usePPISP in [false, true] {
+            let t = try trainer(scan.directory, config(iterations: 1500, ppisp: usePPISP))
+            _ = try train(t, until: 1500)
+            results[usePPISP] = try meanPSNR(t, frames: t.dataset.trainFrames)
+            if usePPISP { learned = t.dataset.frames.indices.map { t.ppisp.exposure(frame: $0) } }
+        }
+        let truth = scan.trueExposure
+        let r = correlation(learned, truth)
+        print("  training-view PSNR without PPISP \(String(format: "%.2f", results[false]!)), with \(String(format: "%.2f", results[true]!)); exposure correlation \(String(format: "%.3f", r))")
+        check(results[true]! > results[false]! + 1.0, "PPISP compensates per-image exposure (+\(String(format: "%.1f", results[true]! - results[false]!)) dB)")
+        check(r > 0.9, "learned exposure offsets follow the applied ones (r = \(String(format: "%.3f", r)))")
+    }
+
+    static func poseRefinement() throws {
+        let scan = try writeScan(name: "pose", frames: 30, poseNoise: (0.01, 0.3), seed: 9)
+        var c = config(iterations: 2000, pose: true)
+        c.seed = 11
+        let t = try trainer(scan.directory, c)
+        _ = try train(t, until: 2000)
+        func errors(_ corrected: Bool) -> (Double, Double) {
+            var rot = 0.0, trans = 0.0
+            for (i, frame) in t.dataset.frames.enumerated() {
+                let truth = GaussianCamera.worldToCamera(arkitRowMajorC2W: scan.truePoses[frame.id - 1])
+                var estimate = GaussianCamera.worldToCamera(arkitRowMajorC2W: frame.transform)
+                if corrected { estimate = t.poses[i].matrix * estimate }
+                let c1 = GaussianCamera.rigidInverse(truth), c2 = GaussianCamera.rigidInverse(estimate)
+                trans += simd_distance(SIMD3(c1[3][0], c1[3][1], c1[3][2]), SIMD3(c2[3][0], c2[3][1], c2[3][2]))
+                let R = simd_double3x3(SIMD3(truth[0][0], truth[0][1], truth[0][2]), SIMD3(truth[1][0], truth[1][1], truth[1][2]), SIMD3(truth[2][0], truth[2][1], truth[2][2]))
+                let S = simd_double3x3(SIMD3(estimate[0][0], estimate[0][1], estimate[0][2]), SIMD3(estimate[1][0], estimate[1][1], estimate[1][2]), SIMD3(estimate[2][0], estimate[2][1], estimate[2][2]))
+                let d = R * S.transpose
+                rot += acos(min(1, max(-1, (d[0][0] + d[1][1] + d[2][2] - 1) / 2))) * 180 / .pi
+            }
+            let n = Double(t.dataset.frames.count)
+            return (rot / n, trans / n * 1000)
+        }
+        let before = errors(false), after = errors(true)
+        print(String(format: "  pose error %.3f° / %.2f mm -> %.3f° / %.2f mm", before.0, before.1, after.0, after.1))
+        check(after.0 < before.0 * 0.8 || after.1 < before.1 * 0.8, "pose refinement reduces the perturbation of the recorded poses")
+        // Metric scale: the mean camera distance to the scene centre is unchanged by rigid corrections.
+        check(t.poses.allSatisfy { $0.rotationDegrees < 5 && $0.translationMeters < 0.1 }, "pose corrections stay bounded near the ARKit prior")
+    }
+
+    /// Photos blurred over the exposure and read row by row: the capture-motion model should
+    /// reproduce them better and, rendered still, be sharper than training without it.
+    static func captureMotion() throws {
+        let motion = (exposure: 0.06, readout: 0.06)
+        let scan = try writeScan(name: "motion", frames: 36, seed: 13, motion: motion)
+        var results: [Bool: (photo: Double, sharp: Double)] = [:]
+        for modeled in [false, true] {
+            var c = config(iterations: 2000, holdOut: 6)
+            if modeled { c.motionBlur = true; c.rollingShutterReadout = motion.readout }
+            let t = try trainer(scan.directory, c)
+            _ = try train(t, until: 2000)
+            let photo = try t.evaluate(frames: t.dataset.validationFrames).psnr
+            var sharp = 0.0
+            for i in t.dataset.validationFrames {
+                let frame = t.dataset.frames[i]
+                let w2c = GaussianCamera.worldToCamera(arkitRowMajorC2W: scan.truePoses[frame.id - 1])
+                let camera = GaussianCamera(worldToCamera: w2c, fx: frame.intrinsics.fx, fy: frame.intrinsics.fy, cx: frame.intrinsics.cx,
+                                            cy: frame.intrinsics.cy, width: t.dataset.width, height: t.dataset.height, mipFilter: true)
+                guard let truth = try scan.renderer.render(model: scan.model, camera: camera, shDegree: 0, isp: nil, background: scan.background),
+                      let estimate = try t.renderer.render(model: t.model, camera: camera, shDegree: t.activeDegree, isp: nil, background: scan.background) else { continue }
+                sharp += psnr([UInt8](truth.pixels), [UInt8](estimate.pixels))
+            }
+            results[modeled] = (photo, sharp / Double(t.dataset.validationFrames.count))
+        }
+        let off = results[false]!, on = results[true]!
+        print(String(format: "  held-out photos: %.2f -> %.2f dB; sharp reference: %.2f -> %.2f dB", off.photo, on.photo, off.sharp, on.sharp))
+        check(on.photo > off.photo + 0.5, "the capture-motion model reproduces blurred, rolling-shutter photos (+\(String(format: "%.1f", on.photo - off.photo)) dB)")
+        check(on.sharp > off.sharp + 0.5, "trained with the motion model, still renders are sharper (+\(String(format: "%.1f", on.sharp - off.sharp)) dB against the sharp scene)")
+    }
+
+    /// PSNR of two RGBA8 images (RGB only).
+    static func psnr(_ a: [UInt8], _ b: [UInt8]) -> Double {
+        var sum = 0.0, n = 0
+        for i in 0..<min(a.count, b.count) where i % 4 != 3 {
+            let d = (Double(a[i]) - Double(b[i])) / 255; sum += d * d; n += 1
+        }
+        return 10 * log10(1 / max(sum / Double(max(1, n)), 1e-12))
+    }
+
+    static func capUnderSmallBudget() throws {
+        let scan = try writeScan(name: "cap", frames: 24)
+        var c = config(iterations: 800, maxGaussians: 200_000)
+        c.memoryBudgetMB = nil
+        let dataset = try TrainingDataset.prepare(scan: scan.directory, longEdge: 160, holdOutEvery: 0, maxPoints: 250_000)
+        // Budget that only fits a small capacity.
+        let plan = try TrainingMemoryPlan.fit(width: dataset.width, height: dataset.height, shDegree: 1, requestedGaussians: 200_000,
+                                              budgetBytes: 190 << 20, imageSlots: 3, previewPixels: 320 * 240)
+        let t = try GaussianTrainer(configuration: c, dataset: dataset, plan: plan, metal: metal)
+        try t.initializeModel()
+        var peak = 0
+        _ = try train(t, until: 800) { r in peak = max(peak, r.gaussians) }
+        print("  capacity \(plan.gaussianCapacity), peak live \(peak), total planned \(plan.totalBytes >> 20) MB")
+        check(plan.totalBytes <= 190 << 20 && peak <= plan.gaussianCapacity && t.model.count <= plan.gaussianCapacity,
+              "densification never exceeds the memory plan's Gaussian cap")
+    }
+
+    static func checkpoints() throws {
+        let scan = try writeScan(name: "checkpoint", frames: 20)
+        let c = config(iterations: 600, ppisp: true, pose: true)
+        let a = try trainer(scan.directory, c)
+        _ = try train(a, until: 300)
+        let dir = temp.appendingPathComponent("ck")
+        try GaussianCheckpoint.save(a, elapsedSeconds: 12, to: dir)
+        let url = dir.appendingPathComponent(GaussianCheckpoint.fileName)
+        let b = try trainer(scan.directory, c)
+        let header = try GaussianCheckpoint.load(url, into: b)
+        var identical = header.iteration == 300 && b.model.activeCount == a.model.activeCount && b.ppisp == a.ppisp && b.poses == a.poses
+        let pa = a.model.floats(a.model.params), pb = b.model.floats(b.model.params)
+        for (k, row) in a.model.liveRows.enumerated() {
+            for (offset, width) in a.model.layout.groups where width > 0 {
+                for j in 0..<width where pa[offset + row * width + j] != pb[offset + k * width + j] { identical = false }
+            }
+        }
+        check(identical, "a checkpoint restores parameters, Adam state, PPISP, poses and schedule exactly")
+        let ra = try train(a, until: 400), rb = try train(b, until: 400)
+        let la = ra.suffix(50).map(\.loss).reduce(0, +) / 50, lb = rb.suffix(50).map(\.loss).reduce(0, +) / 50
+        print("  loss after resume: uninterrupted \(la), resumed \(lb)")
+        check(abs(la - lb) / la < 0.03 && ra.map(\.frame) == rb.map(\.frame), "a resumed run follows the uninterrupted run (same views, loss within 3%)")
+        // A version 1 checkpoint (before the relocation statistics) still resumes.
+        let v1 = temp.appendingPathComponent("ck-v1")
+        try GaussianCheckpoint.save(b, elapsedSeconds: 12, to: v1, formatVersion: 1)
+        let old = try trainer(scan.directory, c)
+        let oldHeader = try GaussianCheckpoint.load(v1.appendingPathComponent(GaussianCheckpoint.fileName), into: old)
+        let views = old.model.stat(GaussianStats.views)
+        check(oldHeader.version == 1 && old.model.activeCount == b.model.activeCount && (0..<old.model.count).allSatisfy { views[$0] == 0 },
+              "a version 1 checkpoint resumes, with the relocation statistics starting at zero")
+        // Corruption and truncation are detected.
+        var bytes = try Data(contentsOf: url)
+        bytes[bytes.count / 2] ^= 0x5A
+        let corrupt = dir.appendingPathComponent("corrupt.gsck")
+        try bytes.write(to: corrupt)
+        var detected = false
+        do { _ = try GaussianCheckpoint.load(corrupt, into: try trainer(scan.directory, c)) } catch GaussianCheckpoint.CheckpointError.corrupt { detected = true }
+        check(detected, "a flipped byte is rejected by the checksum")
+        let truncated = dir.appendingPathComponent("truncated.gsck")
+        try Data(contentsOf: url).prefix(Int(Double(bytes.count) * 0.7)).write(to: truncated)
+        detected = false
+        do { _ = try GaussianCheckpoint.load(truncated, into: try trainer(scan.directory, c)) } catch GaussianCheckpoint.CheckpointError.corrupt { detected = true }
+        check(detected, "a truncated checkpoint is rejected")
+        let other = try writeScan(name: "checkpoint-other", frames: 21)
+        detected = false
+        do { _ = try GaussianCheckpoint.load(url, into: try trainer(other.directory, c)) } catch GaussianCheckpoint.CheckpointError.incompatible { detected = true }
+        check(detected, "a checkpoint of different inputs is refused")
+        // A crash while writing leaves only a partial temporary file; the last checkpoint still loads.
+        try Data(repeating: 7, count: 1000).write(to: dir.appendingPathComponent(".checkpoint-crash.partial"))
+        _ = try train(a, until: 450)
+        try GaussianCheckpoint.save(a, elapsedSeconds: 20, to: dir)
+        let reloaded = try GaussianCheckpoint.load(url, into: try trainer(scan.directory, c))
+        check(reloaded.iteration == 450, "checkpoints are replaced atomically and stay loadable")
+    }
+
+    static func session() throws {
+        let scan = try writeScan(name: "session", frames: 20)
+        let workspace = TrainingWorkspace(scan: scan.directory)
+        var c = config(iterations: 700, ppisp: true, pose: true, holdOut: 5)
+        c.memoryBudgetMB = 400
+        final class Box: @unchecked Sendable { var snapshots: [TrainingSnapshot] = []; var frames = 0; let lock = NSLock() }
+        let box = Box()
+        func run(resume: Bool, configuration: GaussianTrainingConfiguration? = nil,
+                 control: ((GaussianTrainingSession) -> Void)? = nil) -> TrainingSnapshot {
+            box.lock.lock(); box.snapshots.removeAll(); box.lock.unlock()
+            let s = GaussianTrainingSession(workspace: workspace, configuration: configuration ?? c, resume: resume, libraryURL: library)
+            s.onSnapshot = { snap in box.lock.lock(); box.snapshots.append(snap); box.lock.unlock() }
+            s.onFrame = { _, _ in box.lock.lock(); box.frames += 1; box.lock.unlock() }
+            s.onPreparedViews = { views, depth in
+                let o = OrbitCamera(arkitTransform: views[0].transform, intrinsics: views[0].intrinsics, depth: depth)
+                s.updateViewer(ViewerRequest(orbit: o, captureFrame: nil, width: 120, height: 160, mode: .camera), interactive: false)
+            }
+            let thread = Thread { s.run() }
+            thread.start()
+            control?(s)
+            while !s.isFinished { Thread.sleep(forTimeInterval: 0.05) }
+            box.lock.lock(); defer { box.lock.unlock() }
+            return box.snapshots.last!
+        }
+        func waitIteration(_ s: GaussianTrainingSession, _ n: Int) {
+            while true {
+                box.lock.lock(); let it = box.snapshots.last?.iteration ?? 0; box.lock.unlock()
+                if it >= n { return }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+        // Pause, checkpoint while paused, resume, then stop keeping the checkpoint.
+        let stopped = run(resume: false) { s in
+            waitIteration(s, 150)
+            s.pause()
+            Thread.sleep(forTimeInterval: 0.5)
+            s.updateViewer(ViewerRequest(orbit: nil, captureFrame: 2, width: 120, height: 90, mode: .camera), interactive: true)
+            Thread.sleep(forTimeInterval: 0.3)
+            s.resumeTraining()
+            waitIteration(s, 300)
+            s.cancel(keepCheckpoint: true)
+        }
+        box.lock.lock(); let paused = box.snapshots.contains { $0.phase == .paused }; box.lock.unlock()
+        let record = workspace.record()
+        check(paused && stopped.phase == .cancelled && workspace.hasCheckpoint && record?.status == .cancelled
+              && (record?.checkpointIteration ?? 0) >= 300, "pause, resume and stop-with-checkpoint keep a resumable state")
+        check(box.frames > 0, "the live viewer received renders while training and while paused")
+        // Leaving the app saves a checkpoint while training continues; a stale partial file of
+        // an interrupted write is removed by the next save. No other checkpoint is written.
+        let stale = workspace.root.appendingPathComponent(".checkpoint-stale.partial")
+        try Data([1, 2, 3]).write(to: stale)
+        var leftAt = 0
+        _ = run(resume: true) { s in
+            box.lock.lock(); let start = box.snapshots.last?.iteration ?? 0; box.lock.unlock()
+            waitIteration(s, start + 50)
+            s.setAppInBackground(true)
+            box.lock.lock(); leftAt = box.snapshots.last?.iteration ?? 0; box.lock.unlock()
+            waitIteration(s, leftAt + 60)
+            s.setAppInBackground(false)
+            s.cancel(keepCheckpoint: false)
+        }
+        box.lock.lock()
+        let savedOnLeaving = box.snapshots.contains { $0.phase == .running && ($0.checkpointIteration ?? 0) >= leftAt }
+        box.lock.unlock()
+        let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: workspace.root.path))?.filter { $0.hasSuffix(".partial") } ?? []
+        check(savedOnLeaving && leftovers.isEmpty && !FileManager.default.fileExists(atPath: stale.path),
+              "leaving the app saves a checkpoint while training continues, and stale partial files are removed")
+        // Stop-with-keep again, for the resume below.
+        _ = run(resume: false) { s in waitIteration(s, 300); s.cancel(keepCheckpoint: true) }
+        // An app kill mid-run leaves "running" on disk; it reads as interrupted.
+        var running = record!
+        running.status = .running
+        try workspace.save(running)
+        check(workspace.record()?.status == .interrupted, "a run the app did not finish reads as interrupted in History")
+        // Resuming needs room for the checkpoint's rows; with less memory now it says how much.
+        let fits = try TrainingMemoryPlan.fit(width: 160, height: 120, shDegree: c.shDegree, requestedGaussians: 8_192, budgetBytes: 400 << 20)
+        var refusal: String?
+        do { try GaussianTrainingSession.checkResumeFits(rows: fits.gaussianCapacity + 1_000, plan: fits) } catch { refusal = error.localizedDescription }
+        let accepted = (try? GaussianTrainingSession.checkResumeFits(rows: fits.gaussianCapacity, plan: fits)) != nil
+        check(accepted && (refusal ?? "").contains("可用記憶體不足以載入上次的進度") && (refusal ?? "").contains("MB"),
+              "a checkpoint larger than today's memory plan is refused with the memory it needs, not as damaged")
+        // Resume to the end: model files are exported and the checkpoint is removed. The app
+        // leaves while the model is saved and the GPU goes away mid-save: the save waits for the
+        // foreground and starts again instead of failing the run.
+        let resumeFrom = GaussianCheckpoint.header(at: workspace.checkpointURL)!.iteration
+        final class Attempts: @unchecked Sendable { var count = 0; var waited = false; let lock = NSLock() }
+        let attempts = Attempts()
+        let done = run(resume: true) { s in
+            s.savingProbe = {
+                attempts.lock.lock(); attempts.count += 1; let first = attempts.count == 1; attempts.lock.unlock()
+                guard first else { return }
+                s.setBackgrounded(true)
+                throw GaussianTrainer.TrainingError.gpuFailure("background")
+            }
+            while true {
+                attempts.lock.lock(); let tried = attempts.count; attempts.lock.unlock()
+                if tried > 0 { break }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            Thread.sleep(forTimeInterval: 0.4)
+            box.lock.lock(); let waiting = box.snapshots.last?.phase == .paused && box.snapshots.last?.reason == .background; box.lock.unlock()
+            attempts.lock.lock(); attempts.waited = waiting && attempts.count == 1; attempts.lock.unlock()
+            s.setBackgrounded(false)
+        }
+        let files = [GaussianSOG.fileName, GaussianExport.plyName, GaussianExport.metadataName, GaussianExport.experimentName,
+                     GaussianExport.ppispName, GaussianExport.posesName, GaussianExport.reportName, "preview.jpg"].allSatisfy {
+            FileManager.default.fileExists(atPath: workspace.modelDirectory.appendingPathComponent($0).path)
+        }
+        check(done.phase == .completed && files && !FileManager.default.fileExists(atPath: workspace.checkpointURL.path)
+              && workspace.record()?.status == .completed && resumeFrom >= 300,
+              "resuming from iteration \(resumeFrom) completes the run and saves the model")
+        box.lock.lock()
+        let saving = box.snapshots.filter { $0.phase == .finishing }.compactMap(\.saving)
+        box.lock.unlock()
+        let staged = (try? FileManager.default.contentsOfDirectory(atPath: workspace.root.path))?.filter { $0.hasPrefix(".model-") } ?? []
+        check(attempts.waited && attempts.count == 2 && staged.isEmpty && done.saving == nil
+              && saving.contains { if case .validating = $0.step { return true }; return false }
+              && saving.contains { if case .sog = $0.step { return true }; return false },
+              "losing the GPU mid-save waits in the background and saves again in the foreground, with the save's progress published (\(saving.count) updates)")
+        // The scan's own files were never modified.
+        let poses = try Data(contentsOf: scan.directory.appendingPathComponent("poses.jsonl"))
+        let recorded = ScanLibrary.readRecords(scan.directory.appendingPathComponent("poses.jsonl"))
+        check(!poses.isEmpty && recorded.count == 20 && recorded.map(\.transform) == ScanLibrary.readRecords(scan.directory.appendingPathComponent("poses.jsonl")).map(\.transform),
+              "the scan's original poses stay unchanged; refined poses go to the model folder")
+        // Saved-model viewer renders the model with the same ISP.
+        let viewer = try GaussianModelViewer(workspace: workspace, metal: metal)
+        let sem = DispatchSemaphore(value: 0)
+        final class Result: @unchecked Sendable { var frame: RenderedFrame? }
+        let result = Result()
+        let o = OrbitCamera(arkitTransform: viewer.views[0].transform, intrinsics: viewer.views[0].intrinsics, depth: viewer.initialDepth)
+        viewer.render(ViewerRequest(orbit: o, captureFrame: nil, width: 120, height: 160, mode: .camera)) { f, _ in result.frame = f; sem.signal() }
+        while sem.wait(timeout: .now() + 0.01) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        let lit = result.frame.map { Set($0.pixels.enumerated().filter { $0.offset % 4 == 0 }.map(\.element)).count } ?? 0
+        check(viewer.gaussians > 0 && lit > 20, "the saved model reloads in the viewer and renders an image")
+        let metadata = try JSONDecoder.training.decode(GaussianExport.Metadata.self,
+            from: Data(contentsOf: workspace.modelDirectory.appendingPathComponent(GaussianExport.metadataName)))
+        check(metadata.mipFilter2D && metadata.opacityCompensation && metadata.ppisp == GaussianExport.ppispName && !metadata.viewerNotes.isEmpty,
+              "model metadata records the mip filter, PPISP sidecar and viewer limitations")
+        let experiment = try JSONDecoder.training.decode(GaussianTrainingSession.Experiment.self,
+            from: Data(contentsOf: workspace.modelDirectory.appendingPathComponent(GaussianExport.experimentName)))
+        check(experiment.methodName == GaussianExport.prototypeMethodName
+              && experiment.sourceRevision == GaussianExport.prototypeSourceRevision
+              && experiment.actualIterations == done.iteration
+              && experiment.gaussians == viewer.gaussians
+              && !experiment.trainingFrames.isEmpty
+              && experiment.outputs.contains(GaussianSOG.fileName)
+              && experiment.outputs.contains(GaussianExport.plyName),
+              "experiment manifest records the method revision, configuration, training frames and actual output")
+        // The dataset ZIP leaves the training folder out.
+        let zip = try ExportManager.makeArchive(of: scan.directory)
+        let listing = try String(decoding: Data(contentsOf: zip), as: UTF8.self)
+        check(!listing.contains(TrainingWorkspace.folderName) && listing.contains("poses.jsonl"),
+              "the dataset archive excludes the training checkpoint and model")
+        let model = try workspace.makeModelArchive(format: .sog)
+        let modelEntries = try StoredZip.entries(Data(contentsOf: model))
+        let modelFiles = Set(modelEntries.keys.map { URL(fileURLWithPath: $0).lastPathComponent })
+        check(modelFiles.contains(GaussianSOG.fileName) && !modelFiles.contains(GaussianExport.plyName)
+              && modelFiles.contains(GaussianExport.experimentName) && modelFiles.contains(GaussianExport.ppispName),
+              "SOG sharing includes only the selected model and its reproducibility sidecars")
+        // A retrain only replaces the saved model when it completes.
+        let savedModel = try Data(contentsOf: workspace.modelURL)
+        _ = run(resume: false) { s in waitIteration(s, 120); s.cancel(keepCheckpoint: false) }
+        check(workspace.hasModel && (try? Data(contentsOf: workspace.modelURL)) == savedModel && !workspace.hasCheckpoint
+              && workspace.record()?.status == .completed, "stopping a retrain with delete keeps the saved model and its status")
+        _ = run(resume: false) { s in waitIteration(s, 120); s.cancel(keepCheckpoint: true) }
+        check(workspace.hasModel && workspace.hasCheckpoint && workspace.record()?.status == .cancelled,
+              "a retrain stopped with its progress can resume while the saved model stays")
+        try workspace.discardProgress()
+        check(workspace.hasModel && !workspace.hasCheckpoint && workspace.record()?.status == .completed
+              && (try? Data(contentsOf: workspace.modelURL)) == savedModel,
+              "deleting a retrain's progress restores the saved model's completed status")
+        // Enhance model: continue the saved model for 300 more iterations.
+        let saved = GaussianExport.metadata(in: workspace.modelDirectory)!
+        var extra = c
+        extra.iterations = 300
+        let enhanced = extra.enhancing(savedIterations: saved.iterations, savedGaussians: saved.gaussians, savedSHDegree: saved.shDegree)
+        let finished = run(resume: false, configuration: enhanced)
+        box.lock.lock()
+        let started = box.snapshots.first { $0.phase == .running }
+        let neverRestarted = box.snapshots.allSatisfy { $0.iteration >= saved.iterations && $0.startIteration == saved.iterations }
+        box.lock.unlock()
+        let after = GaussianExport.metadata(in: workspace.modelDirectory)
+        print("  enhancement: started \(started?.iteration ?? -1), restarted \(!neverRestarted), finished \(finished.phase) \(finished.iteration)/\(finished.total), saved \(after?.iterations ?? -1), progress \(workspace.record()?.progress ?? -1)")
+        check(finished.phase == .completed && started?.iteration == saved.iterations && neverRestarted
+              && workspace.record()?.progress == 1
+              && after?.iterations == saved.iterations + 300 && workspace.record()?.status == .completed
+              && (try? Data(contentsOf: workspace.modelURL)) != savedModel && !workspace.hasCheckpoint,
+              "Enhance model continues from iteration \(saved.iterations) to \(saved.iterations + 300) and replaces the model")
+        // Finish now, also from a pause: the current model becomes the result.
+        let early = run(resume: false) { s in
+            waitIteration(s, 150)
+            s.pause()
+            Thread.sleep(forTimeInterval: 0.3)
+            s.finishNow()
+        }
+        let earlyRecord = workspace.record()
+        let earlyMetadata = GaussianExport.metadata(in: workspace.modelDirectory)
+        check(early.phase == .completed && earlyRecord?.status == .completed && earlyRecord?.finishedEarly == true
+              && (earlyRecord?.iteration ?? 0) >= 150 && (earlyRecord?.iteration ?? 0) < c.iterations
+              && earlyMetadata?.iterations == earlyRecord?.iteration && !workspace.hasCheckpoint,
+              "Finish and save model ends a paused run at iteration \(earlyRecord?.iteration ?? 0) and saves it as the model")
+    }
+
+
+    static func sessionBackgroundControls() throws {
+        let scan = try writeScan(name: "background-controls", frames: 12)
+        var c = config(iterations: 12, maxGaussians: 4_096, holdOut: 3)
+        c.memoryBudgetMB = 300
+        let workspace = TrainingWorkspace(scan: scan.directory)
+        final class State: @unchecked Sendable {
+            let lock = NSLock()
+            var latest = TrainingSnapshot()
+            var triggered = false
+            let paused = DispatchSemaphore(value: 0)
+            let finished = DispatchSemaphore(value: 0)
+        }
+        func wait(_ semaphore: DispatchSemaphore, _ label: String) {
+            check(semaphore.wait(timeout: .now() + 30) == .success, label)
+        }
+        // Stop during preparation before even allocating the Metal trainer, then cancel.
+        do {
+            let state = State()
+            let session = GaussianTrainingSession(workspace: workspace, configuration: c, resume: false, libraryURL: library)
+            session.setBackgrounded(true)
+            session.onSnapshot = { snapshot in
+                state.lock.lock(); state.latest = snapshot; state.lock.unlock()
+                if snapshot.phase == .paused { state.paused.signal() }
+            }
+            Thread { session.run(); state.finished.signal() }.start()
+            wait(state.paused, "preparation acknowledges a background pause")
+            state.lock.lock(); let snapshot = state.latest; state.lock.unlock()
+            check(snapshot.plannedMB == 0 && snapshot.gaussians == 0,
+                  "background preparation pauses before allocating or initializing the GPU trainer")
+            session.cancel(keepCheckpoint: false)
+            wait(state.finished, "cancelling paused preparation exits without waiting for foreground")
+        }
+        // Cancel from progress callbacks at both validation and GPU SOG compression boundaries.
+        for cancelAtSOG in [false, true] {
+            let state = State()
+            let session = GaussianTrainingSession(workspace: workspace, configuration: c, resume: false, libraryURL: library)
+            session.onSnapshot = { snapshot in
+                state.lock.lock()
+                state.latest = snapshot
+                let shouldStop: Bool
+                if case .sog(.clustering) = snapshot.saving?.step { shouldStop = cancelAtSOG }
+                else if case .validating = snapshot.saving?.step { shouldStop = !cancelAtSOG }
+                else { shouldStop = false }
+                let stop = shouldStop && snapshot.phase == .finishing && !state.triggered
+                if stop { state.triggered = true }
+                state.lock.unlock()
+                if stop { session.cancel(keepCheckpoint: true) }
+            }
+            Thread { session.run(); state.finished.signal() }.start()
+            wait(state.finished, "cancellation during \(cancelAtSOG ? "SOG compression" : "validation") exits")
+            state.lock.lock(); let snapshot = state.latest; let triggered = state.triggered; state.lock.unlock()
+            let staged = try FileManager.default.contentsOfDirectory(atPath: workspace.root.path).filter { $0.hasPrefix(".model-") }
+            check(triggered && snapshot.phase == .cancelled && snapshot.saving == nil && workspace.hasCheckpoint
+                  && !workspace.hasModel && staged.isEmpty,
+                  "cancelled saving retains a checkpoint, removes staged output, and never publishes a completed model")
+        }
+        // System expiration pauses even in the foreground; background permission returning does
+        // not override that pause. Only the explicit resume permits remaining GPU/save work.
+        do {
+            let state = State()
+            let session = GaussianTrainingSession(workspace: workspace, configuration: c, resume: false, libraryURL: library)
+            session.onSnapshot = { snapshot in
+                state.lock.lock(); state.latest = snapshot
+                let stop: Bool
+                if case .sog(.clustering) = snapshot.saving?.step { stop = !state.triggered && snapshot.phase == .finishing }
+                else { stop = false }
+                if stop { state.triggered = true }
+                state.lock.unlock()
+                if stop { session.pause(); session.setBackgrounded(true) }
+                if snapshot.phase == .paused { state.paused.signal() }
+            }
+            Thread { session.run(); state.finished.signal() }.start()
+            wait(state.paused, "SOG saving acknowledges expiration with a paused snapshot")
+            session.setBackgrounded(false)
+            Thread.sleep(forTimeInterval: 0.1)
+            state.lock.lock(); let stayedPaused = state.latest.phase == .paused; state.lock.unlock()
+            check(stayedPaused && workspace.hasCheckpoint && !workspace.hasModel,
+                  "returning to foreground cannot resume system-cancelled saving without explicit resume")
+            session.resumeTraining()
+            wait(state.finished, "explicit resume finishes the paused SOG export")
+            state.lock.lock(); let snapshot = state.latest; state.lock.unlock()
+            check(snapshot.phase == .completed && workspace.hasModel && !workspace.hasCheckpoint,
+                  "resuming paused saving publishes the model and removes the checkpoint")
+        }
+        // Replay the Metal reference kernel on exactly the buffers consumed by the CPU fold;
+        // separately trained models can differ through floating-point GPU reduction order.
+        let foldConfig = config(iterations: 600, maxGaussians: 4_096)
+        let foldTrainer = try trainer(scan.directory, foldConfig)
+        _ = try train(foldTrainer, until: 10)
+        let model = foldTrainer.model
+        let beforeViews = foldTrainer.strategy.edgeViews
+        let beforeStats = Data(bytes: model.stats.contents(), count: model.stats.length)
+        let gradients = foldTrainer.raster.grad2d.contents().bindMemory(to: Float.self,
+                                                                       capacity: model.count * GaussianRasterizer.grad2DStride)
+        let sampleStride = max(1, model.count / 20_000)
+        let positive = stride(from: 0, to: model.count, by: sampleStride).compactMap { row -> Float? in
+            let value = gradients[row * GaussianRasterizer.grad2DStride + 11]
+            return value > 0 ? value : nil
+        }
+        let median = MRNFStrategy.median(positive) ?? 0
+        let edgeScale: Float = median > 0 ? 1 / median : 0
+        try foldTrainer.flushPendingFold(useCPU: true)
+        let cpuStats = Array(UnsafeBufferPointer(start: model.floats(model.stats), count: model.stats.length / 4))
+        beforeStats.withUnsafeBytes { model.stats.contents().copyMemory(from: $0.baseAddress!, byteCount: beforeStats.count) }
+        let command = metal.queue.makeCommandBuffer()!, encoder = command.makeComputeCommandEncoder()!
+        encoder.dispatch(try metal.pipeline("mrnf_fold"), threads: model.count,
+                         [.buffer(foldTrainer.raster.grad2d), .buffer(model.stats),
+                          .value(SIMD2<UInt32>(UInt32(model.count), UInt32(model.capacity))), .f32(edgeScale)])
+        encoder.endEncoding(); command.commit(); command.waitUntilCompleted()
+        let equal = [GaussianStats.visibility, GaussianStats.errorMax, GaussianStats.edgeSum].allSatisfy { plane in
+            (0..<model.count).allSatisfy { row in
+                let a = model.stat(plane)[row], b = cpuStats[plane * model.capacity + row]
+                return abs(a - b) <= max(1e-5, abs(a) * 1e-5)
+            }
+        }
+        check(equal && command.error == nil && foldTrainer.strategy.edgeViews == beforeViews + 1,
+              "background checkpoint CPU fold matches Metal visibility/error/edge statistics")
+    }
+
+    static func largeScanStress() throws {
+        // 1,200 small frames: dataset preparation, streaming with a 3-image cache, and a tight
+        // budget. Footprint growth must stay within the plan.
+        let scan = try writeScan(name: "large", frames: 1_200, width: 96, height: 72, seed: 21, grid: true)
+        let baseline = TrainingMemoryPlan.footprintBytes
+        let c = config(iterations: 1_500, ppisp: true, pose: true, maxGaussians: 30_000)
+        let dataset = try TrainingDataset.prepare(scan: scan.directory, longEdge: 96, holdOutEvery: 0, maxPoints: 250_000)
+        let plan = try TrainingMemoryPlan.fit(width: dataset.width, height: dataset.height, shDegree: 1, requestedGaussians: 30_000,
+                                              budgetBytes: 200 << 20, imageSlots: 3, previewPixels: 160 * 120)
+        let t = try GaussianTrainer(configuration: c, dataset: dataset, plan: plan, metal: metal)
+        try t.initializeModel()
+        var peak = 0
+        _ = try train(t, until: 1_500) { r in if r.iteration % 100 == 0 { peak = max(peak, TrainingMemoryPlan.footprintBytes) } }
+        let growth = peak - baseline
+        print("  \(dataset.frames.count) frames, planned \(plan.totalBytes >> 20) MB, footprint growth \(growth >> 20) MB, live \(t.model.activeCount)")
+        check(dataset.frames.count >= 1_100 && growth < plan.totalBytes + (64 << 20) && t.model.count <= plan.gaussianCapacity,
+              "a 1,200-frame scan trains within the planned memory (streamed images, bounded cache)")
+    }
+}

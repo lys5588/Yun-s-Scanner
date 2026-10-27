@@ -1,0 +1,86 @@
+<!-- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+     Copyright 2026 Kuo Feng-Yuan (KuoFengYuan). See LICENSE and NOTICE. -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地高斯重建演示</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">仅本机 localhost · 不上传云端</p>
+      <h1>手机视频高斯重建演示</h1>
+      <p class="subhead">导入手机视频，在 Mac 上重建高斯模型、查看效果并导出。</p>
+    </div>
+    <div id="connection" class="badge pending">正在连接本地服务</div>
+  </header>
+
+  <main>
+    <section class="card setup">
+      <h2>1. 导入输入</h2>
+      <p>视频只发送到当前电脑的本地服务。服务会将其放入收件箱，随后选择一个文件开始处理。</p>
+      <p id="inbox-path" class="hint"></p>
+      <div class="upload-row">
+        <label class="file-picker">选择手机视频<input id="video-file" type="file" accept="video/*" hidden></label>
+        <span id="upload-name" class="muted">尚未选择文件</span>
+        <button id="upload-button" type="button" disabled>上传到本地收件箱</button>
+      </div>
+      <div class="field-row">
+        <label for="inbox-select">收件箱文件</label>
+        <select id="inbox-select"><option value="">正在读取收件箱…</option></select>
+        <button id="refresh-button" type="button" class="secondary">刷新</button>
+      </div>
+      <div class="field-row">
+        <label for="iterations">训练迭代</label>
+        <input id="iterations" type="number" value="4000" min="10" max="20000" step="10">
+        <button id="start-button" type="button">开始本地处理与训练</button>
+      </div>
+      <p id="start-note" class="hint">默认 Quick 演示使用 4,000 次迭代。</p>
+    </section>
+
+    <section class="card environment">
+      <div class="section-heading"><h2>本机环境</h2><span id="environment-summary" class="muted">正在检测</span></div>
+      <div id="environment-list" class="environment-list"></div>
+      <p id="toolchain-note" class="hint"></p>
+    </section>
+
+    <section class="workspace">
+      <section class="card run-list-card">
+        <div class="section-heading"><h2>2. 运行历史</h2><span id="active-run" class="muted">没有活动任务</span></div>
+        <div id="runs-empty" class="empty">还没有运行记录。</div>
+        <ol id="runs-list" class="runs-list"></ol>
+      </section>
+
+      <section class="card detail-card">
+        <div class="section-heading"><h2>3. 当前运行</h2><span id="run-status" class="badge neutral">未选择</span></div>
+        <p id="run-description" class="muted">选择一条运行记录查看阶段、日志和模型。</p>
+        <div class="actions">
+          <button id="retry-button" type="button" disabled>继续训练</button>
+          <button id="cancel-button" type="button" class="danger" disabled>取消当前运行</button>
+          <a id="download-model" class="button-link disabled" href="#" download>下载模型 ZIP</a>
+        </div>
+        <label class="log-label" for="run-log">服务日志</label>
+        <pre id="run-log">等待选择运行记录。</pre>
+      </section>
+    </section>
+
+    <section class="card viewer-card">
+      <div class="section-heading">
+        <div><h2>4. 模型查看</h2><p class="muted">查看训练导出的高斯 PLY。拖动旋转，滚轮缩放，按 R 重置视角。</p></div>
+        <a id="open-viewer" class="button-link disabled" href="#" target="_blank" rel="noopener">新窗口打开</a>
+      </div>
+      <div id="viewer-placeholder" class="viewer-placeholder">模型完成后会在这里加载。可旋转、平移和缩放。</div>
+      <iframe id="viewer-frame" title="高斯模型查看器" hidden></iframe>
+    </section>
+  </main>
+
+  <template id="run-template">
+    <li><button type="button" class="run-item"><strong class="run-id"></strong><span class="run-source"></span><span class="run-stage"></span></button></li>
+  </template>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

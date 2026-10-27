@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# Python (tools/)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 掃描資料 / 訓練輸出（裝置端產物，不入庫）
+scans/
+local-data/
+*.zip
+tools/**/output/
+
+# 編輯器
+.idea/
+*.swp
+
+# 本机数据、凭证与旧迁移包清单
+beta-scenes/
+exports/
+.env
+.env.*
+*.p12
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.keychain*
+/TRANSFER_MANIFEST.json

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Noncommercial research prototype: on-device capture, reconstruction and viewing",
+  "upstreamRepository": "https://github.com/KuoFengYuan/arkit-3dgs-scanner",
+  "upstreamCommit": "ed156e2e468fdd70d33aef68e7c98c6f03718dda",
+  "upstreamLicense": "PolyForm-Noncommercial-1.0.0",
+  "targetDevice": "iPhone 18 Pro",
+  "targetOS": "iOS 27",
+  "validationScene": "30–60 second static desktop object or room corner",
+  "nativeFrameworks": ["ARKit", "AVFoundation", "RealityKit"],
+  "trainingBackend": "upstream Swift/Metal 3DGS",
+  "timingPolicy": "Measure on the device; no assumed latency guarantee"
+}

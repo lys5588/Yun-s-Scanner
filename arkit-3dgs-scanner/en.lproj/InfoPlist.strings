@@ -1,0 +1,3 @@
+"NSCameraUsageDescription" = "Camera access is needed to capture images and camera poses for 3DGS datasets.";
+
+"NSLocationWhenInUseUsageDescription" = "Record scene locations while capturing for map viewing and scene export. You can still capture without location access.";
